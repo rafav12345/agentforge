@@ -1,0 +1,462 @@
+/* ============================================
+   AgentForge — Code Generator
+   Export visual flows to runnable Python code
+   ============================================ */
+
+class CodeGenerator {
+  constructor(flowData) {
+    this.flow = flowData;
+    this.varNames = new Map();   // nodeId → python variable name
+    this.usedNames = new Set();
+    this.lines = [];
+    this.indent = 1;             // inside async def main()
+    this.needsAsyncio = false;
+    this.needsRequests = false;
+  }
+
+  /* ---- Public API ---- */
+  generate() {
+    const order = this._topoSort();
+    this._assignVarNames(order);
+    this._scanFeatures(order);
+    this._emitHeader();
+    this._emitMainStart();
+
+    for (const nodeId of order) {
+      const node = this._getNode(nodeId);
+      if (!node) continue;
+      const inputs = this._getInputEdges(nodeId);
+      this._emitNode(node, inputs);
+    }
+
+    this._emitMainEnd();
+    return this.lines.join('\n');
+  }
+
+  highlightPython(code) {
+    // Tokenize-then-reassemble approach to avoid regex conflicts with HTML attributes
+    const tokens = [];
+    const placeholder = (type, text) => {
+      const idx = tokens.length;
+      tokens.push({ type, text });
+      return `\x00T${idx}T\x00`;
+    };
+
+    // Escape HTML first
+    let html = code
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;');
+
+    // 1. Extract triple-quoted strings
+    html = html.replace(/("""[\s\S]*?"""|'''[\s\S]*?''')/g, (m) => placeholder('string', m));
+    // 2. Extract comments (before single strings, since # in strings was already extracted)
+    html = html.replace(/(#[^\n]*)/g, (m) => placeholder('comment', m));
+    // 3. Extract single-quoted strings
+    html = html.replace(/("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')/g, (m) => placeholder('string', m));
+    // 4. Keywords
+    html = html.replace(/\b(import|from|def|async|await|if|elif|else|for|in|return|print|class|try|except|raise|with|as|not|and|or|True|False|None|pass)\b/g, (m) => placeholder('keyword', m));
+    // 5. Function calls
+    html = html.replace(/\b([a-zA-Z_]\w*)\s*\(/g, (m, name) => placeholder('function', name) + '(');
+    // 6. Numbers
+    html = html.replace(/\b(\d+\.?\d*)\b/g, (m) => placeholder('number', m));
+    // 7. Decorators
+    html = html.replace(/(@\w+)/g, (m) => placeholder('decorator', m));
+
+    // Reassemble with real HTML spans
+    const classMap = { string: 'hl-string', comment: 'hl-comment', keyword: 'hl-keyword', function: 'hl-function', number: 'hl-number', decorator: 'hl-decorator' };
+    html = html.replace(/\x00T(\d+)T\x00/g, (_, idx) => {
+      const tok = tokens[parseInt(idx)];
+      return `<span class="${classMap[tok.type]}">${tok.text}</span>`;
+    });
+
+    return html;
+  }
+
+  /* ---- Topological Sort (Kahn's) ---- */
+  _topoSort() {
+    const nodes = new Set(this.flow.nodes.map(n => n.id));
+    const inDegree = new Map();
+    const adj = new Map();
+
+    for (const id of nodes) {
+      inDegree.set(id, 0);
+      adj.set(id, []);
+    }
+
+    for (const edge of this.flow.edges) {
+      if (nodes.has(edge.from) && nodes.has(edge.to)) {
+        adj.get(edge.from).push(edge.to);
+        inDegree.set(edge.to, (inDegree.get(edge.to) || 0) + 1);
+      }
+    }
+
+    const queue = [];
+    for (const [id, deg] of inDegree) {
+      if (deg === 0) queue.push(id);
+    }
+
+    const order = [];
+    while (queue.length > 0) {
+      const id = queue.shift();
+      order.push(id);
+      for (const next of adj.get(id) || []) {
+        inDegree.set(next, inDegree.get(next) - 1);
+        if (inDegree.get(next) === 0) queue.push(next);
+      }
+    }
+    return order;
+  }
+
+  /* ---- Variable naming ---- */
+  _assignVarNames(order) {
+    for (const nodeId of order) {
+      const node = this._getNode(nodeId);
+      if (!node) continue;
+      const label = (node.config && node.config.label) || node.type || 'node';
+      let base = label.toLowerCase()
+        .replace(/[^a-z0-9\s_]/g, '')
+        .replace(/\s+/g, '_')
+        .substring(0, 30);
+      if (!base || /^\d/.test(base)) base = 'node_' + base;
+
+      let name = base;
+      let counter = 2;
+      while (this.usedNames.has(name)) {
+        name = base + '_' + counter++;
+      }
+      this.usedNames.add(name);
+      this.varNames.set(nodeId, name);
+    }
+  }
+
+  /* ---- Scan for features needed ---- */
+  _scanFeatures(order) {
+    for (const nodeId of order) {
+      const node = this._getNode(nodeId);
+      if (!node) continue;
+      if (['debate', 'ensemble', 'supervisor'].includes(node.type)) {
+        this.needsAsyncio = true;
+      }
+      if (node.type === 'tool') {
+        this.needsRequests = true;
+      }
+    }
+  }
+
+  /* ---- Header ---- */
+  _emitHeader() {
+    const name = (this.flow.metadata && this.flow.metadata.name) || 'Untitled Flow';
+    const ts = new Date().toISOString().split('T')[0];
+
+    this.lines.push('#!/usr/bin/env python3');
+    this.lines.push('"""');
+    this.lines.push(`Generated by AgentForge — Visual Agent Pipeline Builder`);
+    this.lines.push(`Flow: ${name}`);
+    this.lines.push(`Generated: ${ts}`);
+    this.lines.push('"""');
+    this.lines.push('');
+    this.lines.push('import anthropic');
+    if (this.needsAsyncio) this.lines.push('import asyncio');
+    if (this.needsRequests) this.lines.push('import requests');
+    this.lines.push('import json');
+    this.lines.push('');
+    this.lines.push('client = anthropic.Anthropic()  # uses ANTHROPIC_API_KEY env var');
+    this.lines.push('');
+  }
+
+  _emitMainStart() {
+    if (this.needsAsyncio) {
+      this.lines.push('async def main():');
+    } else {
+      this.lines.push('def main():');
+    }
+  }
+
+  _emitMainEnd() {
+    this.lines.push('');
+    this.lines.push('');
+    this.lines.push('if __name__ == "__main__":');
+    if (this.needsAsyncio) {
+      this.lines.push('    asyncio.run(main())');
+    } else {
+      this.lines.push('    main()');
+    }
+    this.lines.push('');
+  }
+
+  /* ---- Node emission ---- */
+  _emitNode(node, inputs) {
+    const varName = this.varNames.get(node.id);
+    const label = (node.config && node.config.label) || node.type;
+    const pad = '    '; // 4 spaces for inside main()
+
+    this.lines.push(`${pad}# === ${label} (${node.type}) ===`);
+
+    switch (node.type) {
+      case 'input':
+        this._emitInput(node, varName, pad);
+        break;
+      case 'output':
+        this._emitOutput(node, varName, inputs, pad);
+        break;
+      case 'llm':
+        this._emitLLM(node, varName, inputs, pad);
+        break;
+      case 'condition':
+        this._emitCondition(node, varName, inputs, pad);
+        break;
+      case 'merge':
+        this._emitMerge(node, varName, inputs, pad);
+        break;
+      case 'datasource':
+        this._emitDataSource(node, varName, pad);
+        break;
+      case 'tool':
+        this._emitTool(node, varName, inputs, pad);
+        break;
+      case 'loop':
+        this._emitLoop(node, varName, inputs, pad);
+        break;
+      case 'debate':
+        this._emitDebate(node, varName, inputs, pad);
+        break;
+      case 'ensemble':
+        this._emitEnsemble(node, varName, inputs, pad);
+        break;
+      case 'supervisor':
+        this._emitSupervisor(node, varName, inputs, pad);
+        break;
+      case 'barrier':
+        this._emitBarrier(node, varName, inputs, pad);
+        break;
+      default:
+        this.lines.push(`${pad}${varName} = None  # Unknown node type: ${node.type}`);
+    }
+    this.lines.push('');
+  }
+
+  _emitInput(node, varName, pad) {
+    const val = (node.config && node.config.defaultValue) || 'Enter input here...';
+    const escaped = val.replace(/\\/g, '\\\\').replace(/"""/g, '\\"\\"\\"');
+    this.lines.push(`${pad}${varName} = """${escaped}"""`);
+  }
+
+  _emitOutput(node, varName, inputs, pad) {
+    const label = (node.config && node.config.label) || 'Output';
+    const inputVar = this._getInputVar(inputs);
+    this.lines.push(`${pad}print(f"\\n{'='*50}")`);
+    this.lines.push(`${pad}print(f"  ${label}")`);
+    this.lines.push(`${pad}print(f"{'='*50}")`);
+    this.lines.push(`${pad}print(${inputVar})`);
+  }
+
+  _emitLLM(node, varName, inputs, pad) {
+    const cfg = node.config || {};
+    const model = cfg.model || 'claude-sonnet-4-20250514';
+    const sysPrompt = (cfg.systemPrompt || 'You are a helpful assistant.').replace(/'/g, "\\'").replace(/\n/g, '\\n');
+    const maxTokens = cfg.maxTokens || 1024;
+    const temp = cfg.temperature !== undefined ? cfg.temperature : 0.7;
+    const inputVar = this._getInputVar(inputs);
+
+    this.lines.push(`${pad}${varName}_response = client.messages.create(`);
+    this.lines.push(`${pad}    model="${model}",`);
+    this.lines.push(`${pad}    max_tokens=${maxTokens},`);
+    this.lines.push(`${pad}    system='${sysPrompt}',`);
+    this.lines.push(`${pad}    temperature=${temp},`);
+    this.lines.push(`${pad}    messages=[{"role": "user", "content": str(${inputVar})}]`);
+    this.lines.push(`${pad})`);
+    this.lines.push(`${pad}${varName} = ${varName}_response.content[0].text`);
+  }
+
+  _emitCondition(node, varName, inputs, pad) {
+    const cfg = node.config || {};
+    const expr = cfg.expression || 'True';
+    const inputVar = this._getInputVar(inputs);
+
+    // Find which nodes connect to the true/false ports
+    const trueTargets = this._getOutputEdgeTargets(node.id, 'true');
+    const falseTargets = this._getOutputEdgeTargets(node.id, 'false');
+
+    // Convert JS expression to Python-ish
+    let pyExpr = expr
+      .replace(/input/g, inputVar)
+      .replace(/\.toLowerCase\(\)/g, '.lower()')
+      .replace(/\.includes\(/g, ' in ')
+      .replace(/\)/g, '');
+
+    // Simple heuristic: if it looks like .includes() pattern, restructure
+    if (expr.includes('.includes(')) {
+      const match = expr.match(/(\w+(?:\.[a-zA-Z()]+)*)\.includes\(['"]([^'"]+)['"]\)/);
+      if (match) {
+        let target = match[1].replace('input', inputVar).replace('.toLowerCase()', '.lower()');
+        pyExpr = `"${match[2]}" in ${target}`;
+      }
+    }
+
+    this.lines.push(`${pad}${varName} = ${pyExpr}`);
+    this.lines.push(`${pad}if ${varName}:`);
+    this.lines.push(`${pad}    ${varName}_branch = "true"`);
+    this.lines.push(`${pad}else:`);
+    this.lines.push(`${pad}    ${varName}_branch = "false"`);
+  }
+
+  _emitMerge(node, varName, inputs, pad) {
+    const cfg = node.config || {};
+    const inputVars = this._getMultiInputVars(inputs);
+
+    if (cfg.template && inputVars.length >= 2) {
+      let template = cfg.template
+        .replace(/{{input_a}}/g, `{${inputVars[0]}}`)
+        .replace(/{{input_b}}/g, `{${inputVars[1]}}`)
+        .replace(/\n/g, '\\n');
+      this.lines.push(`${pad}${varName} = f"${template}"`);
+    } else {
+      this.lines.push(`${pad}${varName} = "\\n\\n".join([str(v) for v in [${inputVars.join(', ')}]])`);
+    }
+  }
+
+  _emitDataSource(node, varName, pad) {
+    const cfg = node.config || {};
+    const dataset = cfg.dataset || 'Sample Data';
+    this.lines.push(`${pad}# Data source: ${dataset}`);
+    this.lines.push(`${pad}${varName} = """[${dataset} would be loaded here]"""`);
+  }
+
+  _emitTool(node, varName, inputs, pad) {
+    const cfg = node.config || {};
+    const url = cfg.url || 'https://api.example.com/data';
+    const method = (cfg.method || 'GET').toLowerCase();
+    const inputVar = this._getInputVar(inputs);
+
+    this.lines.push(`${pad}# Tool: ${cfg.label || 'API Call'}`);
+    if (method === 'post') {
+      this.lines.push(`${pad}${varName}_resp = requests.post("${url}", json={"query": str(${inputVar})})`);
+    } else {
+      this.lines.push(`${pad}${varName}_resp = requests.get("${url}", params={"q": str(${inputVar})})`);
+    }
+    this.lines.push(`${pad}${varName} = ${varName}_resp.text`);
+  }
+
+  _emitLoop(node, varName, inputs, pad) {
+    const cfg = node.config || {};
+    const maxIter = cfg.maxIterations || 3;
+    const inputVar = this._getInputVar(inputs);
+
+    this.lines.push(`${pad}${varName}_results = []`);
+    this.lines.push(`${pad}${varName}_current = ${inputVar}`);
+    this.lines.push(`${pad}for ${varName}_i in range(${maxIter}):`);
+    this.lines.push(`${pad}    # Process iteration ${varName}_i`);
+    this.lines.push(`${pad}    ${varName}_results.append(${varName}_current)`);
+    this.lines.push(`${pad}${varName} = "\\n".join(str(r) for r in ${varName}_results)`);
+  }
+
+  _emitDebate(node, varName, inputs, pad) {
+    const cfg = node.config || {};
+    const model = cfg.model || 'claude-sonnet-4-20250514';
+    const rounds = cfg.rounds || 2;
+    const inputVar = this._getInputVar(inputs);
+
+    this.lines.push(`${pad}# Multi-agent debate (${rounds} rounds)`);
+    this.lines.push(`${pad}${varName}_pro_args = []`);
+    this.lines.push(`${pad}${varName}_con_args = []`);
+    this.lines.push(`${pad}for round_num in range(${rounds}):`);
+    this.lines.push(`${pad}    pro = client.messages.create(`);
+    this.lines.push(`${pad}        model="${model}", max_tokens=500,`);
+    this.lines.push(`${pad}        system="You argue FOR the proposition. Be concise and compelling.",`);
+    this.lines.push(`${pad}        messages=[{"role": "user", "content": f"Round {round_num+1}. Topic: {${inputVar}}"}]`);
+    this.lines.push(`${pad}    ).content[0].text`);
+    this.lines.push(`${pad}    ${varName}_pro_args.append(pro)`);
+    this.lines.push(`${pad}    con = client.messages.create(`);
+    this.lines.push(`${pad}        model="${model}", max_tokens=500,`);
+    this.lines.push(`${pad}        system="You argue AGAINST the proposition. Be concise and compelling.",`);
+    this.lines.push(`${pad}        messages=[{"role": "user", "content": f"Round {round_num+1}. Topic: {${inputVar}}\\nPro argument: {pro}"}]`);
+    this.lines.push(`${pad}    ).content[0].text`);
+    this.lines.push(`${pad}    ${varName}_con_args.append(con)`);
+    this.lines.push(`${pad}${varName}_judge = client.messages.create(`);
+    this.lines.push(`${pad}    model="${model}", max_tokens=800,`);
+    this.lines.push(`${pad}    system="You are an impartial judge. Evaluate both sides and declare a winner with reasoning.",`);
+    this.lines.push(`${pad}    messages=[{"role": "user", "content": f"PRO: {${varName}_pro_args}\\nCON: {${varName}_con_args}"}]`);
+    this.lines.push(`${pad}).content[0].text`);
+    this.lines.push(`${pad}${varName} = ${varName}_judge`);
+  }
+
+  _emitEnsemble(node, varName, inputs, pad) {
+    const cfg = node.config || {};
+    const model = cfg.model || 'claude-sonnet-4-20250514';
+    const count = cfg.agentCount || 3;
+    const inputVar = this._getInputVar(inputs);
+
+    this.lines.push(`${pad}# Ensemble of ${count} agents`);
+    this.lines.push(`${pad}${varName}_agents = []`);
+    this.lines.push(`${pad}for agent_i in range(${count}):`);
+    this.lines.push(`${pad}    result = client.messages.create(`);
+    this.lines.push(`${pad}        model="${model}", max_tokens=500,`);
+    this.lines.push(`${pad}        system=f"You are research agent {agent_i+1}. Provide a unique perspective.",`);
+    this.lines.push(`${pad}        messages=[{"role": "user", "content": str(${inputVar})}]`);
+    this.lines.push(`${pad}    ).content[0].text`);
+    this.lines.push(`${pad}    ${varName}_agents.append(result)`);
+    this.lines.push(`${pad}${varName} = "\\n---\\n".join(${varName}_agents)`);
+  }
+
+  _emitSupervisor(node, varName, inputs, pad) {
+    const cfg = node.config || {};
+    const model = cfg.model || 'claude-sonnet-4-20250514';
+    const workers = cfg.workerCount || 3;
+    const inputVar = this._getInputVar(inputs);
+
+    this.lines.push(`${pad}# Supervisor pattern with ${workers} workers`);
+    this.lines.push(`${pad}${varName}_plan = client.messages.create(`);
+    this.lines.push(`${pad}    model="${model}", max_tokens=500,`);
+    this.lines.push(`${pad}    system="You are a supervisor. Break the task into ${workers} subtasks. Output as JSON array of strings.",`);
+    this.lines.push(`${pad}    messages=[{"role": "user", "content": str(${inputVar})}]`);
+    this.lines.push(`${pad}).content[0].text`);
+    this.lines.push(`${pad}try:`);
+    this.lines.push(`${pad}    ${varName}_tasks = json.loads(${varName}_plan)`);
+    this.lines.push(`${pad}except json.JSONDecodeError:`);
+    this.lines.push(`${pad}    ${varName}_tasks = [${varName}_plan]`);
+    this.lines.push(`${pad}${varName}_results = []`);
+    this.lines.push(`${pad}for task in ${varName}_tasks:`);
+    this.lines.push(`${pad}    result = client.messages.create(`);
+    this.lines.push(`${pad}        model="${model}", max_tokens=500,`);
+    this.lines.push(`${pad}        system="You are a worker agent. Complete the assigned subtask thoroughly.",`);
+    this.lines.push(`${pad}        messages=[{"role": "user", "content": task}]`);
+    this.lines.push(`${pad}    ).content[0].text`);
+    this.lines.push(`${pad}    ${varName}_results.append(result)`);
+    this.lines.push(`${pad}${varName} = "\\n\\n".join(${varName}_results)`);
+  }
+
+  _emitBarrier(node, varName, inputs, pad) {
+    const inputVars = this._getMultiInputVars(inputs);
+    this.lines.push(`${pad}# Synchronization point — all inputs ready`);
+    this.lines.push(`${pad}${varName} = "\\n\\n".join([str(v) for v in [${inputVars.join(', ')}]])`);
+  }
+
+  /* ---- Helpers ---- */
+  _getNode(nodeId) {
+    return this.flow.nodes.find(n => n.id === nodeId);
+  }
+
+  _getInputEdges(nodeId) {
+    return this.flow.edges.filter(e => e.to === nodeId);
+  }
+
+  _getOutputEdgeTargets(nodeId, port) {
+    return this.flow.edges
+      .filter(e => e.from === nodeId && e.fromPort === port)
+      .map(e => e.to);
+  }
+
+  _getInputVar(inputs) {
+    if (inputs.length === 0) return '"[no input]"';
+    const fromNode = inputs[0].from;
+    return this.varNames.get(fromNode) || '"[unknown]"';
+  }
+
+  _getMultiInputVars(inputs) {
+    if (inputs.length === 0) return ['"[no input]"'];
+    // Sort by port name to maintain order (input_a before input_b)
+    const sorted = [...inputs].sort((a, b) => (a.toPort || '').localeCompare(b.toPort || ''));
+    return sorted.map(e => this.varNames.get(e.from) || '"[unknown]"');
+  }
+}

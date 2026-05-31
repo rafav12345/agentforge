@@ -1,0 +1,219 @@
+/* ============================================
+   AgentForge — Performance Optimizations
+   CSS optimizations for better rendering performance
+   ============================================ */
+
+/* ---- GPU Acceleration & Optimizations ---- */
+
+/* Use transform3d to trigger hardware acceleration for moving elements */
+.node, .palette-node, .connection-ghost {
+  transform: translate3d(0, 0, 0);
+  backface-visibility: hidden;
+  perspective: 1000px;
+}
+
+/* Optimize canvas transforms for smooth panning/zooming */
+#canvas {
+  transform-style: preserve-3d;
+  will-change: transform;
+}
+
+/* Optimize SVG connections for smooth animation */
+.connection-line {
+  vector-effect: non-scaling-stroke;
+  paint-order: stroke fill markers;
+}
+
+/* ---- Animation Performance ---- */
+
+/* Reduce motion for users with vestibular motion sensitivities */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* Efficient pulse animation using transform instead of opacity */
+@keyframes pulse-transform {
+  0%, 100% { transform: scale(1); }
+  50% { transform: scale(1.05); }
+}
+
+/* Optimize glow effects */
+.node-executing {
+  animation: pulse-transform 1s ease-in-out infinite;
+  box-shadow: 0 0 20px var(--accent-glow);
+  /* Use transform instead of changing box-shadow for better performance */
+}
+
+/* ---- Layout Performance ---- */
+
+/* Use contain property to isolate layout changes */
+.node {
+  contain: layout style paint;
+}
+
+.canvas-container {
+  contain: layout;
+  isolation: isolate; /* Create new stacking context */
+}
+
+.sidebar {
+  contain: layout style;
+}
+
+/* ---- Memory Optimization ---- */
+
+/* Optimize large lists with virtualization hints */
+.node-list {
+  overflow: auto;
+  /* Enable containment for better scrolling performance */
+  contain: strict;
+}
+
+.node-list-item {
+  contain: layout style;
+}
+
+/* ---- Text Rendering Optimization ---- */
+
+/* Optimize text rendering for better performance */
+body, .node-title, .node-content {
+  text-rendering: optimizeSpeed;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* High-quality text rendering only for important UI elements */
+.topbar, .flow-name, .config-label {
+  text-rendering: optimizeLegibility;
+}
+
+/* ---- Efficient Selectors ---- */
+
+/* Use efficient class-based selectors instead of complex ones */
+.node--selected {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent-glow);
+}
+
+.node--executing {
+  background: linear-gradient(135deg, var(--bg-2), var(--accent-glow));
+}
+
+.node--error {
+  border-color: var(--danger);
+  background: linear-gradient(135deg, var(--bg-2), rgba(255, 107, 107, 0.1));
+}
+
+.connection--active {
+  stroke: var(--accent);
+  stroke-width: 3px;
+  filter: drop-shadow(0 0 4px var(--accent-glow));
+}
+
+/* ---- Responsive Performance ---- */
+
+/* Optimize for different screen sizes */
+@media (max-width: 768px) {
+  /* Reduce visual complexity on mobile */
+  .node {
+    box-shadow: none;
+    border-radius: 4px;
+  }
+
+  .connection-line {
+    stroke-width: 2px;
+  }
+
+  /* Disable hover effects on touch devices */
+  .node:hover {
+    transform: none;
+  }
+}
+
+/* ---- Critical Rendering Path Optimizations ---- */
+
+/* Prioritize above-the-fold content */
+.topbar, .sidebar {
+  content-visibility: visible;
+}
+
+/* Defer non-critical content */
+.config-panel, .dashboard-panel {
+  content-visibility: auto;
+  contain-intrinsic-size: 300px;
+}
+
+/* ---- Grid and Flexbox Optimizations ---- */
+
+/* Use subgrid where supported for better layout performance */
+@supports (grid-template-rows: subgrid) {
+  .node-list {
+    display: grid;
+    grid-template-rows: subgrid;
+  }
+}
+
+/* Optimize flex layouts */
+.topbar-center {
+  flex-shrink: 0;
+  flex-grow: 0;
+}
+
+.topbar-left, .topbar-right {
+  flex: 1;
+  min-width: 0; /* Prevent flex items from overflowing */
+}
+
+/* ---- Loading States ---- */
+
+/* Efficient skeleton loading animation */
+@keyframes skeleton-loading {
+  0% { background-position: -200px 0; }
+  100% { background-position: calc(200px + 100%) 0; }
+}
+
+.skeleton {
+  background: linear-gradient(
+    90deg,
+    var(--bg-2) 25%,
+    var(--bg-3) 37%,
+    var(--bg-2) 63%
+  );
+  background-size: 400px 100%;
+  animation: skeleton-loading 1.5s ease-in-out infinite;
+}
+
+/* ---- Intersection Observer Optimizations ---- */
+
+/* Mark elements for intersection observation */
+.lazy-load {
+  content-visibility: auto;
+  contain-intrinsic-size: 200px;
+}
+
+/* ---- Print Optimizations ---- */
+
+@media print {
+  /* Hide interactive elements in print */
+  .sidebar, .topbar, .config-panel {
+    display: none !important;
+  }
+
+  /* Optimize for print layout */
+  .canvas-container {
+    position: static !important;
+    width: 100% !important;
+    height: auto !important;
+  }
+
+  /* Remove animations and transitions for print */
+  *, *::before, *::after {
+    animation: none !important;
+    transition: none !important;
+    box-shadow: none !important;
+  }
+}
