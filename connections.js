@@ -18,6 +18,7 @@ class ConnectionManager {
     this.tempPath = null;
     this.dragging = false;
     this.dragFrom = null;
+    this.onConnectionRemoved = null;
   }
 
   // Create a cubic bezier path between two points
@@ -42,6 +43,8 @@ class ConnectionManager {
     this.connections = this.connections.filter(c => {
       if (c.to.nodeId === toNodeId && c.to.port === toPort) {
         this.removePath(c);
+        this.unmarkPortsConnected(c);
+        if (this.onConnectionRemoved) this.onConnectionRemoved(c);
         return false;
       }
       return true;
@@ -77,6 +80,7 @@ class ConnectionManager {
     this.removePath(conn);
     this.unmarkPortsConnected(conn);
     this.connections.splice(idx, 1);
+    if (this.onConnectionRemoved) this.onConnectionRemoved(conn);
   }
 
   removePath(conn) {
@@ -177,7 +181,10 @@ class ConnectionManager {
   }
 
   clear() {
-    this.connections.forEach(c => this.removePath(c));
+    this.connections.forEach(c => {
+      this.removePath(c);
+      this.unmarkPortsConnected(c);
+    });
     this.connections = [];
   }
 }

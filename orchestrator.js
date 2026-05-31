@@ -131,23 +131,58 @@ const MultiAgentExecutors = {
     return inputData;
   },
 
-  // ---- Shared LLM helper ----
+  // ---- Shared LLM helper (with streaming support) ----
   async _callLLM(prompt, systemPrompt, model, temperature = 0.7) {
+    const apiKey = localStorage.getItem('agentforge_api_key');
     try {
+      if (!apiKey) throw new Error('No API key');
       const response = await fetch('https://api.anthropic.com/v1/messages', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': apiKey,
+          'anthropic-version': '2023-06-01',
+          'anthropic-dangerous-direct-browser-access': 'true',
+        },
         body: JSON.stringify({
           model,
           max_tokens: 600,
+          stream: true,
           system: systemPrompt,
           messages: [{ role: 'user', content: prompt }],
         }),
       });
 
       if (!response.ok) throw new Error(`API ${response.status}`);
-      const data = await response.json();
-      return data.content?.filter(c => c.type === 'text').map(c => c.text).join('\n') || '[No response]';
+
+      // Stream the response
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let fullText = '';
+      let buffer = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop();
+
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue;
+          const jsonStr = line.slice(6);
+          if (jsonStr === '[DONE]') continue;
+          try {
+            const event = JSON.parse(jsonStr);
+            if (event.type === 'content_block_delta' && event.delta?.type === 'text_delta') {
+              fullText += event.delta.text;
+            }
+          } catch { /* skip */ }
+        }
+      }
+
+      return fullText || '[No response]';
     } catch {
       // Simulated response
       const seed = prompt.slice(0, 30);
@@ -184,9 +219,9 @@ class Arena {
       timestamp: Date.now(),
       flowA: nameA,
       flowB: nameB,
-      input: input.slice(0, 200),
-      outputA: resultA.output?.slice(0, 500) || '[No output]',
-      outputB: resultB.output?.slice(0, 500) || '[No output]',
+      input: input.slice(0, 500),
+      outputA: resultA.output?.slice(0, 5000) || '[No output]',
+      outputB: resultB.output?.slice(0, 5000) || '[No output]',
       durationA: resultA.duration,
       durationB: resultB.duration,
       nodesA: resultA.nodeCount,
@@ -307,6 +342,7 @@ class ArenaUI {
   constructor(containerEl) {
     this.container = containerEl;
     this.arena = new Arena();
+    this._pendingMatch = null;
   }
 
   render() {
@@ -324,7 +360,57 @@ class ArenaUI {
     `;
     this.container.appendChild(header);
 
-    // Two-column: leaderboard + match history
+    // ---- New Match Section ----
+    const matchSection = document.createElement('div');
+    matchSection.className = 'arena-new-match';
+    const flows = this._getAvailableFlows();
+
+    if (flows.length < 2) {
+      matchSection.innerHTML = `
+        <div class="arena-new-match-header">
+          <span class="dash-section-title">New Match</span>
+        </div>
+        <div class="dash-empty">
+          <p>Need at least 2 saved flows to start a match.</p>
+          <p class="dash-empty-hint">Go to Builder, create pipelines with "Build with AI", and save them (Ctrl+S).</p>
+        </div>
+      `;
+    } else {
+      const flowOptions = flows.map(f => `<option value="${this._esc(f.name)}">${this._esc(f.name)}</option>`).join('');
+      const flowBDefault = flows.length > 1 ? flows[1].name : flows[0].name;
+
+      matchSection.innerHTML = `
+        <div class="arena-new-match-header">
+          <span class="dash-section-title">New Match</span>
+        </div>
+        <div class="arena-match-setup">
+          <div class="arena-fighter">
+            <label class="arena-fighter-label">Flow A</label>
+            <select id="arena-flow-a" class="config-input">${flowOptions}</select>
+          </div>
+          <div class="arena-vs-badge">VS</div>
+          <div class="arena-fighter">
+            <label class="arena-fighter-label">Flow B</label>
+            <select id="arena-flow-b" class="config-input">${flowOptions}</select>
+          </div>
+        </div>
+        <div class="arena-input-row">
+          <label class="arena-fighter-label">Shared Input</label>
+          <textarea id="arena-input" class="config-textarea" rows="2" placeholder="Enter the test input both flows will process...">I've been waiting 3 weeks for my order and nobody responds to my emails. This is terrible service!</textarea>
+        </div>
+        <button class="btn btn-accent arena-fight-btn" id="arena-fight-btn">⚔️ Fight!</button>
+      `;
+    }
+    this.container.appendChild(matchSection);
+
+    // ---- Results area (for pending match) ----
+    const resultsArea = document.createElement('div');
+    resultsArea.id = 'arena-results';
+    resultsArea.className = 'arena-results';
+    this.container.appendChild(resultsArea);
+    if (this._pendingMatch) this._renderResults(this._pendingMatch);
+
+    // ---- Two-column: leaderboard + match history ----
     const columns = document.createElement('div');
     columns.className = 'dash-columns';
 
@@ -335,7 +421,7 @@ class ArenaUI {
 
     const leaderboard = this.arena.getLeaderboard();
     if (leaderboard.length === 0) {
-      lbCol.innerHTML += `<div class="dash-empty"><p>No rated flows yet.</p><p class="dash-empty-hint">Save some flows and run them against each other in the Arena.</p></div>`;
+      lbCol.innerHTML += `<div class="dash-empty"><p>No rated flows yet.</p><p class="dash-empty-hint">Run some matches above to build the rankings.</p></div>`;
     } else {
       const table = document.createElement('div');
       table.className = 'arena-leaderboard';
@@ -370,20 +456,60 @@ class ArenaUI {
     } else {
       const list = document.createElement('div');
       list.className = 'dash-run-list';
-      matches.slice(0, 20).forEach(match => {
+      matches.slice(0, 20).forEach((match, idx) => {
         const el = document.createElement('div');
-        el.className = 'arena-match';
+        el.className = 'arena-match-card';
         const winnerLabel = match.winner === 'A' ? match.flowA : match.winner === 'B' ? match.flowB : 'Tie';
+        const timeAgo = this._timeAgo(match.timestamp);
         el.innerHTML = `
-          <div class="arena-match-flows">
-            <span class="arena-match-flow ${match.winner === 'A' ? 'winner' : ''}">${this._esc(match.flowA)}</span>
-            <span class="arena-match-vs">vs</span>
-            <span class="arena-match-flow ${match.winner === 'B' ? 'winner' : ''}">${this._esc(match.flowB)}</span>
+          <div class="arena-match-card-header" data-match-idx="${idx}">
+            <div class="arena-match-flows">
+              <span class="arena-match-flow ${match.winner === 'A' ? 'winner' : ''}">${this._esc(match.flowA)}</span>
+              <span class="arena-match-vs">vs</span>
+              <span class="arena-match-flow ${match.winner === 'B' ? 'winner' : ''}">${this._esc(match.flowB)}</span>
+            </div>
+            <div class="arena-match-meta">
+              <span>👑 ${this._esc(winnerLabel)}</span>
+              <span>${match.durationA}ms vs ${match.durationB}ms</span>
+              <span>${timeAgo}</span>
+              <span class="arena-expand-icon">▶</span>
+            </div>
           </div>
-          <div class="arena-match-meta">
-            ${match.durationA}ms vs ${match.durationB}ms · Winner: ${this._esc(winnerLabel)}
+          <div class="arena-match-detail" id="arena-detail-${idx}" style="display:none">
+            <div class="arena-match-input-preview">
+              <span class="arena-fighter-label">Input</span>
+              <div class="arena-detail-text">${this._esc(match.input)}</div>
+            </div>
+            <div class="arena-detail-grid">
+              <div class="arena-detail-side ${match.winner === 'A' ? 'arena-winner' : ''}">
+                <div class="arena-detail-side-header">
+                  <span class="arena-result-name">${this._esc(match.flowA)}</span>
+                  <span class="arena-result-meta">${match.nodesA} nodes · ${match.durationA}ms</span>
+                </div>
+                <div class="arena-detail-text">${this._esc(match.outputA)}</div>
+              </div>
+              <div class="arena-detail-side ${match.winner === 'B' ? 'arena-winner' : ''}">
+                <div class="arena-detail-side-header">
+                  <span class="arena-result-name">${this._esc(match.flowB)}</span>
+                  <span class="arena-result-meta">${match.nodesB} nodes · ${match.durationB}ms</span>
+                </div>
+                <div class="arena-detail-text">${this._esc(match.outputB)}</div>
+              </div>
+            </div>
           </div>
         `;
+        // Toggle expand
+        el.querySelector('.arena-match-card-header').addEventListener('click', () => {
+          const detail = document.getElementById(`arena-detail-${idx}`);
+          const icon = el.querySelector('.arena-expand-icon');
+          if (detail.style.display === 'none') {
+            detail.style.display = 'block';
+            icon.textContent = '▼';
+          } else {
+            detail.style.display = 'none';
+            icon.textContent = '▶';
+          }
+        });
         list.appendChild(el);
       });
       matchCol.appendChild(list);
@@ -393,11 +519,177 @@ class ArenaUI {
     columns.appendChild(matchCol);
     this.container.appendChild(columns);
 
-    // Wire clear button
+    // ---- Wire events ----
+    // Default flow B to second option
+    const flowBSelect = document.getElementById('arena-flow-b');
+    if (flowBSelect && flows.length > 1) flowBSelect.selectedIndex = 1;
+
+    document.getElementById('arena-fight-btn')?.addEventListener('click', () => this._startFight());
     document.getElementById('arena-clear')?.addEventListener('click', () => {
       this.arena.clearHistory();
+      this._pendingMatch = null;
       this.render();
     });
+  }
+
+  async _startFight() {
+    const flowAName = document.getElementById('arena-flow-a')?.value;
+    const flowBName = document.getElementById('arena-flow-b')?.value;
+    const input = document.getElementById('arena-input')?.value?.trim();
+    const btn = document.getElementById('arena-fight-btn');
+
+    if (!flowAName || !flowBName) return;
+    if (flowAName === flowBName) {
+      this._showToast('Pick two different flows');
+      return;
+    }
+    if (!input) {
+      this._showToast('Enter a test input');
+      return;
+    }
+
+    // Loading state
+    btn.disabled = true;
+    btn.innerHTML = '<span class="arena-spinner"></span> Running...';
+
+    try {
+      const flows = this._getAvailableFlows();
+      const flowAInfo = flows.find(f => f.name === flowAName);
+      const flowBInfo = flows.find(f => f.name === flowBName);
+      if (!flowAInfo || !flowBInfo) { this._showToast('Flow not found'); return; }
+
+      // Build graphs
+      const graphA = this._loadFlowGraph(flowAInfo);
+      const graphB = this._loadFlowGraph(flowBInfo);
+      if (!graphA || !graphB) { this._showToast('Could not load flow data'); return; }
+
+      const match = await this.arena.runMatch(graphA, graphB, input, flowAName, flowBName);
+      this._pendingMatch = match;
+      this._renderResults(match);
+    } catch (e) {
+      this._showToast(`Error: ${e.message}`);
+    } finally {
+      btn.disabled = false;
+      btn.innerHTML = '⚔️ Fight!';
+    }
+  }
+
+  _renderResults(match) {
+    const resultsArea = document.getElementById('arena-results');
+    if (!resultsArea) return;
+
+    resultsArea.innerHTML = `
+      <div class="arena-results-header">
+        <span class="dash-section-title">Results</span>
+      </div>
+      <div class="arena-results-grid">
+        <div class="arena-result-card ${match.winner === 'A' ? 'arena-winner' : ''}">
+          <div class="arena-result-name">${this._esc(match.flowA)}</div>
+          <div class="arena-result-meta">${match.nodesA} nodes · ${match.durationA}ms</div>
+          <div class="arena-result-output">${this._esc(match.outputA)}</div>
+          <button class="btn btn-sm arena-vote-btn" data-winner="A">👑 Vote Winner</button>
+        </div>
+        <div class="arena-result-vs">VS</div>
+        <div class="arena-result-card ${match.winner === 'B' ? 'arena-winner' : ''}">
+          <div class="arena-result-name">${this._esc(match.flowB)}</div>
+          <div class="arena-result-meta">${match.nodesB} nodes · ${match.durationB}ms</div>
+          <div class="arena-result-output">${this._esc(match.outputB)}</div>
+          <button class="btn btn-sm arena-vote-btn" data-winner="B">👑 Vote Winner</button>
+        </div>
+      </div>
+      <button class="btn btn-ghost btn-sm arena-tie-btn" data-winner="tie">🤝 Call it a Tie</button>
+    `;
+
+    // Wire vote buttons
+    resultsArea.querySelectorAll('.arena-vote-btn, .arena-tie-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const winner = btn.dataset.winner;
+        const { eloA, eloB } = this.arena.recordWinner(match, winner);
+        this._pendingMatch = null;
+
+        const winnerName = winner === 'A' ? match.flowA : winner === 'B' ? match.flowB : 'Tie';
+        this._showToast(`${winnerName}${winner === 'tie' ? '' : ' wins!'} (ELO: ${eloA} / ${eloB})`);
+        this.render();
+      });
+    });
+  }
+
+  _getAvailableFlows() {
+    const flows = [];
+
+    // Saved flows from storage
+    const storage = new StorageManager();
+    const saved = storage.getFlowList();
+    saved.forEach(f => {
+      flows.push({
+        name: f.metadata?.name || 'Untitled',
+        nodes: f.nodes?.length || 0,
+        source: 'saved',
+      });
+    });
+
+    // Built-in templates (always available)
+    const builder = new NLFlowBuilder();
+    const templates = builder._buildTemplates();
+    for (const [key, tpl] of Object.entries(templates)) {
+      if (key === 'generic') continue;
+      const name = tpl.flow.metadata.name;
+      if (!flows.find(f => f.name === name)) {
+        flows.push({
+          name,
+          nodes: tpl.flow.nodes?.length || 0,
+          source: 'template',
+          templateKey: key,
+        });
+      }
+    }
+
+    return flows;
+  }
+
+  _loadFlowGraph(flowInfo) {
+    let data;
+    if (flowInfo.source === 'saved') {
+      const storage = new StorageManager();
+      data = storage.loadFlow(flowInfo.name);
+    } else {
+      const builder = new NLFlowBuilder();
+      const templates = builder._buildTemplates();
+      const tpl = templates[flowInfo.templateKey];
+      if (tpl) data = JSON.parse(JSON.stringify(tpl.flow));
+    }
+    if (!data) return null;
+
+    // Build a FlowGraph with lightweight node objects (no DOM needed for execution)
+    const createNode = (type, x, y, id) => ({
+      id, type, x, y,
+      nodeConfig: {},
+      config: {},
+      render: () => document.createElement('div'),
+      destroy: () => {},
+    });
+    return FlowGraph.deserialize(data, createNode);
+  }
+
+  _showToast(msg) {
+    let el = document.querySelector('.toast');
+    if (!el) { el = document.createElement('div'); el.className = 'toast'; document.body.appendChild(el); }
+    el.textContent = msg;
+    el.classList.add('show');
+    clearTimeout(this._toastTimer);
+    this._toastTimer = setTimeout(() => el.classList.remove('show'), 2500);
+  }
+
+  _timeAgo(timestamp) {
+    if (!timestamp) return '';
+    const diff = Date.now() - timestamp;
+    const mins = Math.floor(diff / 60000);
+    if (mins < 1) return 'just now';
+    if (mins < 60) return `${mins}m ago`;
+    const hrs = Math.floor(mins / 60);
+    if (hrs < 24) return `${hrs}h ago`;
+    const days = Math.floor(hrs / 24);
+    return `${days}d ago`;
   }
 
   _esc(str) {

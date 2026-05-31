@@ -485,10 +485,12 @@ class FlowGenerator {
       });
     });
 
-    // Create edge definitions
+    // Create edge definitions — always enforce DAG order (lower index → higher index)
     edgeIndices.forEach(e => {
-      const fromNode = flowNodes[e.from];
-      const toNode = flowNodes[e.to];
+      const lo = Math.min(e.from, e.to);
+      const hi = Math.max(e.from, e.to);
+      const fromNode = flowNodes[lo];
+      const toNode = flowNodes[hi];
       if (!fromNode || !toNode) return;
 
       const fromType = NODE_TYPES[fromNode.type];
@@ -498,6 +500,10 @@ class FlowGenerator {
       // Pick compatible ports
       const fromPort = fromType.ports.out[0] || 'output';
       const toPort = toType.ports.in[0] || 'input';
+
+      // Avoid duplicate edges
+      const edgeKey = `${fromNode.id}->${toNode.id}`;
+      if (flowEdges.some(fe => `${fe.from}->${fe.to}` === edgeKey)) return;
 
       flowEdges.push({
         from: fromNode.id,

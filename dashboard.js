@@ -60,8 +60,12 @@ class Dashboard {
     context.logs.forEach(log => {
       if (log.type === 'start' && log.nodeId) startTimes.set(log.nodeId, log.timestamp);
       if (log.type === 'complete' && log.nodeId && startTimes.has(log.nodeId)) {
+        // Try to grab the node's display label from the DOM
+        const nodeEl = document.querySelector(`.node[data-node-id="${log.nodeId}"]`);
+        const nodeLabel = nodeEl?.dataset.label || log.nodeId;
         nodeTimings.push({
           nodeId: log.nodeId,
+          label: nodeLabel,
           duration: log.timestamp - startTimes.get(log.nodeId),
         });
       }
@@ -99,19 +103,34 @@ class Dashboard {
     const runs = this.historyMgr.getRuns();
     this.container.innerHTML = '';
 
+    // Dashboard header
+    const header = document.createElement('div');
+    header.className = 'arena-header';
+    header.innerHTML = `
+      <div class="arena-title">
+        <span style="font-size:28px">📊</span>
+        <span>Dashboard</span>
+      </div>
+      <p class="arena-subtitle">Flow analytics, run history, and performance insights.</p>
+    `;
+    this.container.appendChild(header);
+
     // Metrics row
     const metrics = this._computeMetrics(runs);
+    const flowStats = this._getFlowStats();
     const metricsRow = document.createElement('div');
     metricsRow.className = 'dash-metrics';
     metricsRow.innerHTML = `
       ${this._metricCard('Total Runs', metrics.totalRuns, 'total')}
       ${this._metricCard('Success Rate', metrics.successRate + '%', metrics.successRate >= 80 ? 'good' : metrics.successRate >= 50 ? 'warn' : 'bad')}
       ${this._metricCard('Avg Duration', metrics.avgDuration + 'ms', 'neutral')}
-      ${this._metricCard('Last Run', metrics.lastRun, 'neutral')}
+      ${this._metricCard('Saved Flows', flowStats.savedFlows, 'total')}
+      ${this._metricCard('Current Nodes', flowStats.currentNodes, 'neutral')}
+      ${this._metricCard('Current Edges', flowStats.currentEdges, 'neutral')}
     `;
     this.container.appendChild(metricsRow);
 
-    // Two-column layout: history + chart
+    // Three-column layout: history + performance + flow info
     const columns = document.createElement('div');
     columns.className = 'dash-columns';
 
@@ -141,7 +160,7 @@ class Dashboard {
       historyCol.appendChild(list);
     }
 
-    // Right: timeline chart + performance
+    // Right: performance + node breakdown
     const chartCol = document.createElement('div');
     chartCol.className = 'dash-column';
 
@@ -157,7 +176,6 @@ class Dashboard {
       canvas.height = 140;
       chartEl.appendChild(canvas);
       chartCol.appendChild(chartEl);
-      // Defer drawing until appended to DOM
       requestAnimationFrame(() => this._drawPerfChart(canvas, runs));
     } else {
       chartCol.innerHTML += `<div class="dash-empty"><p>Run at least 2 flows to see performance trends.</p></div>`;
@@ -170,6 +188,41 @@ class Dashboard {
       chartCol.appendChild(timeline);
     }
 
+    // Node type breakdown
+    if (flowStats.nodeTypes && Object.keys(flowStats.nodeTypes).length > 0) {
+      chartCol.innerHTML += `<div class="dash-section-header" style="margin-top:20px"><span class="dash-section-title">Node Composition</span></div>`;
+      const breakdown = document.createElement('div');
+      breakdown.className = 'dash-node-breakdown';
+
+      // Sort by count descending
+      const sorted = Object.entries(flowStats.nodeTypes).sort((a, b) => b[1] - a[1]);
+      const totalNodes = sorted.reduce((sum, [, c]) => sum + c, 0);
+
+      // Color bar
+      const barColors = { input: '#00FFB2', output: '#FF6B6B', llm: '#A78BFA', condition: '#FBBF24', merge: '#38BDF8', tool: '#F472B6', loop: '#FB923C', datasource: '#06B6D4', debate: '#EC4899', ensemble: '#8B5CF6', supervisor: '#14B8A6', barrier: '#6366F1' };
+      const bar = document.createElement('div');
+      bar.className = 'dash-comp-bar';
+      sorted.forEach(([type, count]) => {
+        const pct = (count / totalNodes) * 100;
+        const seg = document.createElement('div');
+        seg.className = 'dash-comp-seg';
+        seg.style.width = pct + '%';
+        seg.style.background = barColors[type] || '#666';
+        seg.title = `${type}: ${count}`;
+        bar.appendChild(seg);
+      });
+      breakdown.appendChild(bar);
+
+      // Legend
+      const legend = document.createElement('div');
+      legend.className = 'dash-comp-legend';
+      sorted.forEach(([type, count]) => {
+        legend.innerHTML += `<span class="dash-comp-item"><span class="dash-comp-dot" style="background:${barColors[type] || '#666'}"></span>${type} (${count})</span>`;
+      });
+      breakdown.appendChild(legend);
+      chartCol.appendChild(breakdown);
+    }
+
     columns.appendChild(historyCol);
     columns.appendChild(chartCol);
     this.container.appendChild(columns);
@@ -179,6 +232,39 @@ class Dashboard {
       this.historyMgr.clearRuns();
       this.render();
     });
+  }
+
+  _getFlowStats() {
+    const storage = new StorageManager();
+    const savedFlows = storage.getFlowList();
+
+    // Get current flow from graph if accessible
+    let currentNodes = 0;
+    let currentEdges = 0;
+    let nodeTypes = {};
+
+    try {
+      // Access the global graph
+      const graphEl = document.querySelectorAll('.node');
+      currentNodes = graphEl.length;
+
+      // Count edges from SVG paths
+      const paths = document.querySelectorAll('.connections-layer path');
+      currentEdges = paths.length;
+
+      // Count node types
+      graphEl.forEach(el => {
+        const type = el.dataset.type || 'unknown';
+        nodeTypes[type] = (nodeTypes[type] || 0) + 1;
+      });
+    } catch { /* ignore */ }
+
+    return {
+      savedFlows: savedFlows.length,
+      currentNodes,
+      currentEdges,
+      nodeTypes,
+    };
   }
 
   _computeMetrics(runs) {
@@ -274,8 +360,16 @@ class Dashboard {
       bar.className = 'timeline-bar';
 
       const nodeId = timing.nodeId;
-      // We don't have graph access here, so show short ID
-      const label = nodeId.slice(-8);
+      // Use stored label if available, otherwise extract readable name from nodeId
+      let label = timing.label || nodeId;
+      if (label === nodeId) {
+        label = nodeId
+          .replace(/^nl_/, '')               // strip NL builder prefix
+          .replace(/_[a-z0-9]{4,6}$/, '')    // strip random suffix
+          .replace(/_/g, ' ')                // underscores → spaces
+          .replace(/\b\w/g, c => c.toUpperCase()) // title case
+          || nodeId;
+      }
 
       bar.innerHTML = `
         <div class="timeline-bar-label">${label}</div>

@@ -17,6 +17,7 @@ class ExecutionContext {
   constructor() {
     this.nodeOutputs = new Map(); // nodeId -> output data
     this.nodeStatus = new Map();  // nodeId -> EXEC_STATUS
+    this.inactiveEdges = new Set(); // "fromId:fromPort->toId:toPort"
     this.logs = [];               // { timestamp, nodeId, type, message, data }
     this.startTime = null;
     this.endTime = null;
@@ -33,6 +34,14 @@ class ExecutionContext {
 
   setStatus(nodeId, status) {
     this.nodeStatus.set(nodeId, status);
+  }
+
+  markEdgeInactive(fromNodeId, fromPort, toNodeId, toPort) {
+    this.inactiveEdges.add(`${fromNodeId}:${fromPort}->${toNodeId}:${toPort}`);
+  }
+
+  isEdgeInactive(fromNodeId, fromPort, toNodeId, toPort) {
+    return this.inactiveEdges.has(`${fromNodeId}:${fromPort}->${toNodeId}:${toPort}`);
   }
 
   log(nodeId, type, message, data = null) {
@@ -64,6 +73,7 @@ class FlowExecutor {
     this.onEdgeActive = null;   // (fromId, toId) => void
     this.onLog = null;          // (logEntry) => void
     this.onComplete = null;     // (context) => void
+    this.onStream = null;       // (nodeId, textSoFar, tokenCount) => void
   }
 
   /**
@@ -102,6 +112,10 @@ class FlowExecutor {
         // Gather inputs from connected predecessors
         const inputData = this._gatherInputs(nodeId);
 
+        if (ctx.nodeStatus.get(nodeId) !== EXEC_STATUS.SKIPPED && this._shouldSkipNode(nodeId)) {
+          ctx.setStatus(nodeId, EXEC_STATUS.SKIPPED);
+        }
+
         // Check if node was skipped (from condition branching)
         if (ctx.nodeStatus.get(nodeId) === EXEC_STATUS.SKIPPED) {
           ctx.log(nodeId, 'skip', `Skipped: ${node.nodeConfig?.label || node.config.label}`);
@@ -112,7 +126,8 @@ class FlowExecutor {
 
         // Execute the node
         ctx.setStatus(nodeId, EXEC_STATUS.RUNNING);
-        if (this.onNodeStart) this.onNodeStart(nodeId);
+        this._currentNodeId = nodeId;
+        if (this.onNodeStart) await this.onNodeStart(nodeId);
 
         ctx.log(nodeId, 'start', `Executing: ${node.nodeConfig?.label || node.config.label}`, { input: inputData });
         this._emitLog(ctx.logs[ctx.logs.length - 1]);
@@ -171,9 +186,13 @@ class FlowExecutor {
   _gatherInputs(nodeId) {
     const entry = this.graph.adjacency.get(nodeId);
     if (!entry || entry.in.length === 0) return null;
+    const node = this.graph.getNode(nodeId);
 
     const inputs = {};
     for (const edge of entry.in) {
+      if (this.context.isEdgeInactive(edge.sourceId, edge.fromPort, nodeId, edge.toPort)) {
+        continue;
+      }
       const sourceOutput = this.context.getOutput(edge.sourceId);
       if (sourceOutput !== undefined) {
         inputs[edge.toPort] = sourceOutput;
@@ -182,9 +201,22 @@ class FlowExecutor {
 
     // If single input, unwrap
     const keys = Object.keys(inputs);
-    if (keys.length === 1) return inputs[keys[0]];
+    const keepStructuredInput = node && ['merge', 'barrier'].includes(node.type);
+    if (keys.length === 1 && !keepStructuredInput) return inputs[keys[0]];
     if (keys.length === 0) return null;
     return inputs;
+  }
+
+  _shouldSkipNode(nodeId) {
+    const entry = this.graph.adjacency.get(nodeId);
+    if (!entry || entry.in.length === 0) return false;
+
+    return entry.in.every(edge => {
+      if (this.context.isEdgeInactive(edge.sourceId, edge.fromPort, nodeId, edge.toPort)) {
+        return true;
+      }
+      return this.context.nodeStatus.get(edge.sourceId) === EXEC_STATUS.SKIPPED;
+    });
   }
 
   // ---- Execute individual node by type ----
@@ -278,18 +310,30 @@ class FlowExecutor {
     // Build messages
     const messages = [{ role: 'user', content: userPrompt }];
 
+    // Find the current node ID for streaming callbacks
+    const currentNodeId = this._currentNodeId;
+
     try {
-      // Real API call to Anthropic
+      // Real API call to Anthropic with streaming
       const body = {
         model,
         max_tokens: maxTokens,
         messages,
+        stream: true,
       };
       if (systemPrompt) body.system = systemPrompt;
 
+      const apiKey = localStorage.getItem('agentforge_api_key');
+      if (!apiKey) throw new Error('Failed to fetch'); // no key → fallback to simulation
+
       const response = await fetch('https://api.anthropic.com/v1/messages', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': apiKey,
+          'anthropic-version': '2023-06-01',
+          'anthropic-dangerous-direct-browser-access': 'true',
+        },
         body: JSON.stringify(body),
       });
 
@@ -298,27 +342,174 @@ class FlowExecutor {
         throw new Error(`API error ${response.status}: ${errData.error?.message || response.statusText}`);
       }
 
-      const data = await response.json();
-      const textContent = data.content
-        .filter(c => c.type === 'text')
-        .map(c => c.text)
-        .join('\n');
+      // Stream the response
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let fullText = '';
+      let tokenCount = 0;
+      let buffer = '';
 
-      return textContent || '[No text response]';
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop(); // keep incomplete line in buffer
+
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue;
+          const jsonStr = line.slice(6);
+          if (jsonStr === '[DONE]') continue;
+
+          try {
+            const event = JSON.parse(jsonStr);
+            if (event.type === 'content_block_delta' && event.delta?.type === 'text_delta') {
+              fullText += event.delta.text;
+              tokenCount++;
+              if (this.onStream) this.onStream(currentNodeId, fullText, tokenCount);
+            }
+          } catch { /* skip non-JSON lines */ }
+        }
+      }
+
+      return fullText || '[No text response]';
 
     } catch (err) {
-      // If API fails, fall back to simulated response
+      // If API fails, fall back to simulated streaming response
       if (err.message.includes('API error') || err.message.includes('Failed to fetch')) {
-        return this._simulateLLM(userPrompt, model);
+        return await this._simulateStreamingLLM(currentNodeId, userPrompt, model, systemPrompt);
       }
       throw err;
     }
   }
 
-  _simulateLLM(prompt, model) {
-    // Simulated LLM response for when API isn't available
-    const trimmed = prompt.slice(0, 100);
-    return `[Simulated ${model} response]\n\nPrompt received: "${trimmed}${prompt.length > 100 ? '...' : ''}"\n\nThis is a simulated response. Connect an API key to get real LLM outputs.`;
+  async _simulateStreamingLLM(nodeId, prompt, model, systemPrompt) {
+    const fullText = this._generateSmartSimulation(prompt, model, systemPrompt || '');
+
+    // Simulate token-by-token streaming
+    const words = fullText.split(/(\s+)/); // split keeping whitespace
+    let accumulated = '';
+    let tokenCount = 0;
+
+    for (const word of words) {
+      accumulated += word;
+      tokenCount++;
+      if (this.onStream) this.onStream(nodeId, accumulated, tokenCount);
+      await this._delay(25); // ~40 tokens/sec feel
+    }
+
+    return fullText;
+  }
+
+  _generateSmartSimulation(prompt, model, systemPrompt) {
+    const sys = (systemPrompt || '').toLowerCase();
+    const p = (prompt || '').toLowerCase();
+
+    // Sentiment classifier
+    if (sys.includes('sentiment') && sys.includes('one word')) {
+      if (p.includes('terrible') || p.includes('angry') || p.includes('worst') || p.includes('waiting') || p.includes('horrible') || p.includes('awful')) return 'negative';
+      if (p.includes('love') || p.includes('great') || p.includes('amazing') || p.includes('excellent') || p.includes('thank')) return 'positive';
+      return 'neutral';
+    }
+
+    // Apology / escalation drafter
+    if (sys.includes('apology') || sys.includes('empathetic') || sys.includes('escalation')) {
+      return "I sincerely apologize for the unacceptable delay with your order. I've personally escalated this to our fulfillment team with a priority flag, and you'll receive a tracking update within 24 hours. As a gesture of goodwill, I've applied a 20% discount to your account for your next purchase.";
+    }
+
+    // Standard customer reply
+    if (sys.includes('customer service') || sys.includes('friendly') || sys.includes('helpful reply')) {
+      return "Thank you for reaching out! I'd be happy to help you with your inquiry. Let me look into this right away and get back to you with a detailed response. Is there anything specific you'd like me to prioritize?";
+    }
+
+    // Summarizer
+    if (sys.includes('summariz') && (sys.includes('concise') || sys.includes('1-2 sentence'))) {
+      return "The ECB maintained interest rates at 2.75%, with President Lagarde noting declining inflation but warning of ongoing risks from energy prices and geopolitical tensions. A rate cut may be considered at the April meeting if inflation continues moderating.";
+    }
+
+    // Translator
+    if (sys.includes('translat') && sys.includes('spanish')) {
+      return "El BCE mantuvo las tasas de interes en el 2,75%, y la presidenta Lagarde senalo la disminucion de la inflacion pero advirtio sobre los riesgos persistentes de los precios de la energia y las tensiones geopoliticas.";
+    }
+
+    // Financial analyst
+    if (sys.includes('financial analyst') || sys.includes('analyst')) {
+      return "CRITICAL INSIGHT: While revenue grew 12% YoY, expenses surged 18% — creating a margin compression that drove net income down 15% to $400K. The churn rate spike from 3.1% to 4.2% correlates with the NPS decline (71 to 62), suggesting a customer satisfaction crisis that will compound revenue risk in Q2 if unaddressed.\n\nRISK LEVEL: HIGH";
+    }
+
+    // Strategy / synthesis
+    if (sys.includes('chief strategy') || sys.includes('synthesiz') || sys.includes('cross-functional')) {
+      return "OVERALL RISK ASSESSMENT: HIGH\n\n1. REVENUE AT RISK: EMEA revenue declined 8% while expenses rose, creating unsustainable margin pressure.\n2. SUPPLY CHAIN BOTTLENECK: Lead times for Enterprise Pro exceed 30 days with 7% stockout rate.\n3. PIPELINE WEAKNESS: 40% of Q1 pipeline is concentrated in 3 deals, all stalled >20 days.\n\nTOP RECOMMENDATION: Immediately deploy a cross-functional task force to address the churn-NPS correlation before it impacts Q2 pipeline conversion.";
+    }
+
+    // Judge / debate
+    if (sys.includes('judge') || sys.includes('impartial') || sys.includes('evaluate both')) {
+      return "After careful evaluation, the PRO arguments present stronger evidence with concrete implementation examples, while the CON arguments raise valid concerns about enforcement. VERDICT: The proposition should be ADOPTED with modifications — mandatory AI disclosure in high-stakes contexts (healthcare, legal, financial) while allowing flexibility in casual consumer interactions.";
+    }
+
+    // Research / ensemble
+    if (sys.includes('research agent') || sys.includes('unique perspective')) {
+      return "From my analysis, the most promising near-term application is in drug discovery, where quantum computing can simulate molecular interactions at unprecedented scale. Recent breakthroughs in error correction have brought practical quantum advantage within 3-5 years for computational chemistry, potentially reducing drug development timelines by 40%.";
+    }
+
+    // Toxicity scorer (content moderation)
+    if (sys.includes('toxicity') || (sys.includes('content safety') && sys.includes('rate'))) {
+      if (p.includes('hate') || p.includes('scam') || p.includes('worst') || p.includes('ashamed')) return 'SCORE: 7/10 | CLASS: WARNING | REASON: Contains strong negative language, personal attacks on creators, and inflammatory tone. No threats or slurs detected.';
+      if (p.includes('kill') || p.includes('threat') || p.includes('die')) return 'SCORE: 10/10 | CLASS: DANGEROUS | REASON: Contains violent language and potential threats requiring immediate review.';
+      return 'SCORE: 2/10 | CLASS: SAFE | REASON: Normal conversational tone, no harmful content detected.';
+    }
+
+    // PII detector (content moderation)
+    if (sys.includes('pii detect') || sys.includes('personal information')) {
+      if (p.includes('@') || p.includes('email')) return 'PII_FOUND | Detected: email address. Recommend redaction before publishing.';
+      if (p.includes('555') || p.includes('phone')) return 'PII_FOUND | Detected: phone number pattern. Recommend redaction before publishing.';
+      return 'PII_CLEAR | No personal identifiable information detected. Content is safe for publishing.';
+    }
+
+    // Security auditor (code review)
+    if (sys.includes('security auditor') || sys.includes('vulnerabilit')) {
+      return '[CRITICAL] SQL Injection — User input is directly concatenated into the query string. An attacker can inject arbitrary SQL.\n[HIGH] Plaintext Passwords — Passwords are compared in plaintext. Must use bcrypt or argon2 hashing.\n[MEDIUM] No Input Validation — No length limits or character filtering on user/pass parameters.';
+    }
+
+    // Code quality analyzer
+    if (sys.includes('code quality') || sys.includes('quality score')) {
+      return 'Quality Score: 2/10\n\n• ERROR HANDLING: None — no try/catch, no validation of db.execute result\n• EDGE CASES: Empty strings, null values, and special characters will cause crashes\n• PERFORMANCE: No connection pooling, no prepared statements\n• NAMING: Function name is acceptable, but parameters should be more descriptive';
+    }
+
+    // Auto-fixer (code review)
+    if (sys.includes('senior developer') && sys.includes('fix')) {
+      return 'async function login(username, password) {\n  const query = "SELECT * FROM users WHERE name = ?";\n  const [user] = await db.execute(query, [username]);\n  if (!user) throw new AuthError("Invalid credentials");\n  const valid = await bcrypt.compare(password, user.hash);\n  if (!valid) throw new AuthError("Invalid credentials");\n  return user;\n}';
+    }
+
+    // Code review report generator
+    if (sys.includes('review report') || sys.includes('pr review')) {
+      return 'VERDICT: BLOCK\n\nCritical security vulnerabilities must be fixed before merge.\n\nSecurity: SQL injection allows complete database compromise. Passwords stored in plaintext.\nQuality: 2/10 — No error handling, no input validation.\nFixed Code: Provided — uses parameterized queries, bcrypt hashing, and proper error handling.\n\nRequired: All 3 critical issues must be resolved. Re-request review after fixes.';
+    }
+
+    // Data validator (ETL)
+    if (sys.includes('data validation') || sys.includes('validation engine')) {
+      return 'VALIDATION REPORT:\n• Record #1: PASS (amount: valid, date: valid) — FLAG: High-value transaction ($5,200)\n• Record #2: PASS (amount: valid, date: valid)\n• Missing Fields: "category" empty on both records — requires enrichment\n• Duplicates: None detected\n• Overall: PASS WITH WARNINGS';
+    }
+
+    // Data cleaner (ETL)
+    if (sys.includes('data cleaning') || sys.includes('standardize format')) {
+      return '{"transactions": [\n  {"id": 1, "amount": 5200.00, "date": "2026-03-15", "merchant": "Amazon Marketplace", "category": "Shopping"},\n  {"id": 2, "amount": 89.99, "date": "2026-03-14", "merchant": "Netflix", "category": "Entertainment"}\n]}';
+    }
+
+    // Data enricher (ETL)
+    if (sys.includes('data enrichment') || sys.includes('enrichment engine')) {
+      return '{"transactions": [\n  {"id": 1, "amount": 5200.00, "date": "2026-03-15", "merchant": "Amazon Marketplace", "category": "Shopping", "risk_flag": "HIGH — exceeds $1K threshold", "tags": ["e-commerce", "high-value"]},\n  {"id": 2, "amount": 89.99, "date": "2026-03-14", "merchant": "Netflix", "category": "Entertainment", "risk_flag": "LOW", "tags": ["subscription", "recurring"]}\n],\n"summary": {"total_spend": 5289.99, "avg_transaction": 2644.99, "high_risk_count": 1}}';
+    }
+
+    // Refiner / quality reviewer
+    if (sys.includes('refin') || sys.includes('quality reviewer') || sys.includes('improve')) {
+      return "Here is the refined and improved version:\n\nThe analysis identifies three critical action items: (1) Address the margin compression by implementing a cost optimization program targeting the 18% expense growth, (2) Launch a customer retention initiative to reverse the NPS decline from 71 to 62, and (3) Accelerate pipeline velocity by focusing on the top 5 stalled deals representing $2.1M in weighted value.";
+    }
+
+    // Default fallback
+    const trimmed = prompt.slice(0, 80);
+    return `[Simulated ${model} response]\n\nPrompt: "${trimmed}${prompt.length > 80 ? '...' : ''}"\n\nThis is a simulated response demonstrating the pipeline flow. Connect an API key for real LLM outputs. The node configuration, routing logic, and data flow are all fully functional.`;
   }
 
   async _execTool(config, inputData) {
@@ -361,6 +552,7 @@ class FlowExecutor {
 
   _execCondition(node, config, inputData) {
     const expression = config.expression || '';
+    const normalizedExpression = expression.replace(/\{\{\s*input\s*\}\}/g, 'input');
     const evaluator = config.evaluator || 'javascript';
     const inputStr = typeof inputData === 'string' ? inputData : JSON.stringify(inputData || '');
 
@@ -370,7 +562,7 @@ class FlowExecutor {
       switch (evaluator) {
         case 'javascript':
           // Safely evaluate with input available
-          const fn = new Function('input', `return Boolean(${expression || 'false'})`);
+          const fn = new Function('input', `return Boolean(${normalizedExpression || 'false'})`);
           result = fn(inputStr);
           break;
 
@@ -399,35 +591,12 @@ class FlowExecutor {
       const skipPort = result ? 'false' : 'true';
       for (const edge of entry.out) {
         if (edge.fromPort === skipPort) {
-          this._markSubtreeSkipped(edge.targetId);
+          this.context.markEdgeInactive(node.id, edge.fromPort, edge.targetId, edge.toPort);
         }
       }
     }
 
     return inputData; // Pass data through to the active branch
-  }
-
-  _markSubtreeSkipped(nodeId) {
-    // BFS to mark all downstream nodes as skipped
-    const visited = new Set();
-    const queue = [nodeId];
-
-    while (queue.length > 0) {
-      const current = queue.shift();
-      if (visited.has(current)) continue;
-      visited.add(current);
-
-      // Only skip if not already executed
-      const currentStatus = this.context.nodeStatus.get(current);
-      if (!currentStatus || currentStatus === EXEC_STATUS.IDLE) {
-        this.context.setStatus(current, EXEC_STATUS.SKIPPED);
-      }
-
-      const entry = this.graph.adjacency.get(current);
-      if (entry) {
-        entry.out.forEach(e => queue.push(e.targetId));
-      }
-    }
   }
 
   async _execLoop(node, config, inputData) {
@@ -464,6 +633,7 @@ class FlowExecutor {
           const valStr = typeof val === 'string' ? val : JSON.stringify(val);
           template = template.replace(new RegExp(`\\{\\{${key}\\}\\}`, 'g'), valStr);
         });
+        template = template.replace(/\{\{[^}]+\}\}/g, '');
         return template;
       }
 
@@ -508,13 +678,18 @@ class ExecutionUI {
     const executor = new FlowExecutor(graph);
     this.executor = executor;
 
-    // Wrap with debugger for trace recording
-    if (debugger_) {
-      debugger_.wrapExecutor(executor);
-    }
+    // NOTE: debugger wrapping moved AFTER UI callbacks are set (below)
 
     // Update Run button
     const runBtn = document.getElementById('btn-run');
+    const resetRunButton = () => {
+      if (!runBtn) return;
+      runBtn.innerHTML = `
+        <svg width="14" height="14" viewBox="0 0 14 14" fill="currentColor"><path d="M3 1l10 6-10 6V1z"/></svg>
+        Run Flow
+      `;
+      runBtn.classList.remove('running');
+    };
     if (runBtn) {
       runBtn.innerHTML = `
         <svg width="14" height="14" viewBox="0 0 14 14" fill="currentColor"><rect x="3" y="3" width="8" height="8" rx="1"/></svg>
@@ -526,6 +701,12 @@ class ExecutionUI {
     // ---- Progress bar ----
     const validator = new FlowValidator(graph);
     const validation = validator.validate();
+    if (!validation.executionReady) {
+      this.running = false;
+      resetRunButton();
+      this._appendError('Flow validation failed. Fix errors before running.');
+      return;
+    }
     const totalNodes = validation.topoOrder ? validation.topoOrder.length : 0;
     let completedNodes = 0;
 
@@ -573,7 +754,7 @@ class ExecutionUI {
         this._removeThinkingIndicator(node);
 
         // Show output preview on node
-        if (output && status === EXEC_STATUS.SUCCESS) {
+        if (output !== undefined && status === EXEC_STATUS.SUCCESS) {
           this._showNodeOutput(node, output);
         }
       }
@@ -607,6 +788,13 @@ class ExecutionUI {
       this._appendLog(entry, graph);
     };
 
+    // Streaming: show live tokens inside node body
+    executor.onStream = (nodeId, textSoFar, tokenCount) => {
+      const node = graph.getNode(nodeId);
+      if (!node || !node.el) return;
+      this._showStreamingText(node, textSoFar, tokenCount);
+    };
+
     executor.onComplete = (ctx) => {
       this.running = false;
 
@@ -614,13 +802,7 @@ class ExecutionUI {
       progressBar.classList.add('fade-out');
       setTimeout(() => progressBar.remove(), 500);
 
-      if (runBtn) {
-        runBtn.innerHTML = `
-          <svg width="14" height="14" viewBox="0 0 14 14" fill="currentColor"><path d="M3 1l10 6-10 6V1z"/></svg>
-          Run Flow
-        `;
-        runBtn.classList.remove('running');
-      }
+      resetRunButton();
 
       // Summary line
       const summaryEl = document.createElement('div');
@@ -641,7 +823,7 @@ class ExecutionUI {
       const sinks = graph.getSinks();
       for (const sinkId of sinks) {
         const output = ctx.getOutput(sinkId);
-        if (output) {
+        if (output !== undefined) {
           this._appendFinalOutput(output, graph.getNode(sinkId));
         }
       }
@@ -650,9 +832,133 @@ class ExecutionUI {
       if (this._recordCallback) this._recordCallback(ctx);
     };
 
+    // Wrap with debugger AFTER UI callbacks are set so it can intercept them
+    if (debugger_) {
+      debugger_.wrapExecutor(executor);
+    }
+
+    // ---- Debugger UI wiring ----
+    if (debugger_) {
+      const toolbar = document.getElementById('debugger-toolbar');
+      const dbgStatus = document.getElementById('dbg-status');
+      const inspector = document.getElementById('data-inspector');
+      const inspectorTitle = document.getElementById('data-inspector-title');
+      const inspectorInput = document.getElementById('data-inspector-input');
+      const inspectorOutput = document.getElementById('data-inspector-output');
+      const stepBtn = document.getElementById('dbg-step-over');
+      const continueBtn = document.getElementById('dbg-continue');
+      const inspectorClose = document.getElementById('data-inspector-close');
+
+      if (toolbar) toolbar.style.display = 'flex';
+
+      // Enable/disable buttons
+      const setDebugButtons = (enabled) => {
+        if (stepBtn) stepBtn.disabled = !enabled;
+        if (continueBtn) continueBtn.disabled = !enabled;
+      };
+      setDebugButtons(false);
+
+      // On pause — highlight node, dim others, show inspector
+      debugger_.onPause = (nodeId, stepIndex, traceEntry) => {
+        setDebugButtons(true);
+        const node = graph.getNode(nodeId);
+        const label = node ? (node.nodeConfig?.label || node.config.label) : nodeId;
+        if (dbgStatus) dbgStatus.textContent = `Paused: ${label}`;
+
+        // Visual: pause highlight + dim others
+        document.querySelectorAll('.node').forEach(el => {
+          el.classList.remove('debug-paused', 'debug-dimmed');
+          if (el.dataset.nodeId === nodeId || el.id === nodeId) {
+            el.classList.add('debug-paused');
+          } else if (!el.classList.contains('exec-success') && !el.classList.contains('exec-error')) {
+            el.classList.add('debug-dimmed');
+          }
+        });
+        // Also check by node.el
+        if (node && node.el) {
+          node.el.classList.remove('debug-dimmed', 'executing');
+          node.el.classList.add('debug-paused');
+        }
+
+        // Show data inspector
+        if (inspector) {
+          inspector.style.display = 'block';
+          if (inspectorTitle) inspectorTitle.textContent = label;
+          if (inspectorInput) {
+            const inputStr = traceEntry.input
+              ? JSON.stringify(traceEntry.input, null, 2)
+              : '(no input)';
+            inspectorInput.textContent = inputStr.slice(0, 2000);
+          }
+          if (inspectorOutput) inspectorOutput.textContent = 'Waiting...';
+        }
+      };
+
+      // On resume — clear pause visuals
+      debugger_.onResume = () => {
+        setDebugButtons(false);
+        if (dbgStatus) dbgStatus.textContent = 'Running...';
+        document.querySelectorAll('.node').forEach(el => {
+          el.classList.remove('debug-paused', 'debug-dimmed');
+        });
+        if (inspector) inspector.style.display = 'none';
+      };
+
+      // Update inspector output when node completes
+      debugger_.onStepLeave = (nodeId, status) => {
+        if (inspector && inspector.style.display !== 'none') {
+          const traceEntry = debugger_.traceHistory.find(
+            t => t.nodeId === nodeId && (t.status === 'success' || t.status === 'error')
+          );
+          if (traceEntry && inspectorOutput) {
+            const outputStr = traceEntry.output
+              ? JSON.stringify(traceEntry.output, null, 2)
+              : `(${status})`;
+            inspectorOutput.textContent = outputStr.slice(0, 2000);
+          }
+        }
+      };
+
+      // On finish — clean up debugger UI
+      debugger_.onFinish = () => {
+        if (toolbar) toolbar.style.display = 'none';
+        if (inspector) inspector.style.display = 'none';
+        if (dbgStatus) dbgStatus.textContent = '';
+        setDebugButtons(false);
+        document.querySelectorAll('.node').forEach(el => {
+          el.classList.remove('debug-paused', 'debug-dimmed');
+        });
+      };
+
+      // Button handlers
+      const stepHandler = () => { if (debugger_.paused) debugger_.stepOver(); };
+      const continueHandler = () => { if (debugger_.paused) debugger_.resume(); };
+      const closeHandler = () => { if (inspector) inspector.style.display = 'none'; };
+
+      if (stepBtn) {
+        stepBtn.removeEventListener('click', stepBtn._dbgHandler);
+        stepBtn._dbgHandler = stepHandler;
+        stepBtn.addEventListener('click', stepHandler);
+      }
+      if (continueBtn) {
+        continueBtn.removeEventListener('click', continueBtn._dbgHandler);
+        continueBtn._dbgHandler = continueHandler;
+        continueBtn.addEventListener('click', continueHandler);
+      }
+      if (inspectorClose) {
+        inspectorClose.removeEventListener('click', inspectorClose._dbgHandler);
+        inspectorClose._dbgHandler = closeHandler;
+        inspectorClose.addEventListener('click', closeHandler);
+      }
+    }
+
     try {
       await executor.execute(initialInput);
     } catch (err) {
+      this.running = false;
+      progressBar.remove();
+      resetRunButton();
+      if (debugger_?.onFinish) debugger_.onFinish();
       this._appendError(err.message);
     }
   }
@@ -737,6 +1043,15 @@ class ExecutionUI {
   _showNodeOutput(node, output) {
     // Add a small output preview to the node body
     if (!node.el) return;
+
+    // Clean up streaming text if present
+    const streamEl = node.el.querySelector('.node-stream-text');
+    if (streamEl) streamEl.remove();
+
+    // Restore label
+    const label = node.el.querySelector('.node-body-label');
+    if (label) label.style.display = '';
+
     let preview = node.el.querySelector('.node-output-preview');
     if (!preview) {
       preview = document.createElement('div');
@@ -745,6 +1060,42 @@ class ExecutionUI {
     }
     const text = typeof output === 'string' ? output : JSON.stringify(output);
     preview.textContent = text.slice(0, 80) + (text.length > 80 ? '...' : '');
+  }
+
+  _showStreamingText(node, textSoFar, tokenCount) {
+    if (!node.el) return;
+    const body = node.el.querySelector('.node-body');
+    if (!body) return;
+
+    // Replace thinking indicator with streaming text
+    const thinking = body.querySelector('.node-thinking');
+    if (thinking) thinking.remove();
+
+    // Hide the default label during streaming
+    const label = body.querySelector('.node-body-label');
+    if (label) label.style.display = 'none';
+
+    // Create or update streaming text container
+    let streamEl = body.querySelector('.node-stream-text');
+    if (!streamEl) {
+      streamEl = document.createElement('div');
+      streamEl.className = 'node-stream-text';
+      body.appendChild(streamEl);
+    }
+    // Show last ~80 chars of streamed text
+    const display = textSoFar.length > 80
+      ? '...' + textSoFar.slice(-77)
+      : textSoFar;
+    streamEl.textContent = display;
+
+    // Token counter badge
+    let badge = node.el.querySelector('.node-token-badge');
+    if (!badge) {
+      badge = document.createElement('div');
+      badge.className = 'node-token-badge';
+      node.el.appendChild(badge);
+    }
+    badge.textContent = tokenCount + ' tokens';
   }
 
   // ---- Data particle animation along SVG paths ----
@@ -884,6 +1235,12 @@ class ExecutionUI {
     document.querySelectorAll('.node').forEach(el => {
       el.classList.remove('executing', 'exec-success', 'exec-error', 'exec-skipped');
       el.querySelector('.node-output-preview')?.remove();
+      el.querySelector('.node-token-badge')?.remove();
+      el.querySelector('.node-stream-text')?.remove();
+      el.querySelector('.node-thinking')?.remove();
+      // Restore label if hidden by streaming
+      const label = el.querySelector('.node-body-label');
+      if (label) label.style.display = '';
     });
     document.querySelectorAll('.connection-path').forEach(el => {
       el.classList.remove('active');

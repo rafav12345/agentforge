@@ -523,14 +523,20 @@ class FlowDebugger {
     this.traceHistory = [];        // [{nodeId, input, output, status}]
     this.currentStep = -1;
     this.paused = false;
+    this.stepMode = false;         // when true, pause before EVERY node
+    this.active = false;           // true while a debug session is running
     this._resumeResolve = null;
+    this._executor = null;
 
     // UI callbacks
     this.onStepEnter = null;    // (nodeId, stepIndex) => void
     this.onStepLeave = null;    // (nodeId, status) => void
     this.onBreakpoint = null;   // (nodeId) => void
+    this.onPause = null;        // (nodeId, stepIndex, traceEntry) => void
+    this.onResume = null;       // () => void
     this.onDataInspect = null;  // (nodeId, input, output) => void
     this.onTraceUpdate = null;  // (traceHistory) => void
+    this.onFinish = null;       // () => void
   }
 
   toggleBreakpoint(nodeId) {
@@ -543,6 +549,14 @@ class FlowDebugger {
     }
   }
 
+  hasBreakpoint(nodeId) {
+    return this.breakpoints.has(nodeId);
+  }
+
+  clearBreakpoints() {
+    this.breakpoints.clear();
+  }
+
   /**
    * Create a trace-enabled executor that pauses at breakpoints
    * and records all intermediate data.
@@ -551,16 +565,34 @@ class FlowDebugger {
     const self = this;
     self.traceHistory = [];
     self.currentStep = -1;
+    self.active = true;
+    self._executor = executor;
 
     const origOnNodeStart = executor.onNodeStart;
     const origOnNodeComplete = executor.onNodeComplete;
+    const origOnComplete = executor.onComplete;
 
     executor.onNodeStart = async (nodeId) => {
       self.currentStep++;
+
+      // Capture input data from executor context
+      const inputData = executor.context ? executor.context.getOutput(nodeId) : null;
+      // Actually gather inputs from predecessors
+      let collectedInput = null;
+      const entry = self.graph.adjacency.get(nodeId);
+      if (entry) {
+        const inputs = {};
+        for (const edge of entry.in) {
+          const srcOutput = executor.context?.getOutput(edge.sourceId);
+          if (srcOutput !== undefined) inputs[edge.toPort] = srcOutput;
+        }
+        if (Object.keys(inputs).length > 0) collectedInput = inputs;
+      }
+
       self.traceHistory.push({
         nodeId,
         step: self.currentStep,
-        input: null,
+        input: collectedInput,
         output: null,
         status: 'running',
         timestamp: Date.now(),
@@ -569,20 +601,24 @@ class FlowDebugger {
       if (origOnNodeStart) origOnNodeStart(nodeId);
       if (self.onStepEnter) self.onStepEnter(nodeId, self.currentStep);
 
-      // Check breakpoint
-      if (self.breakpoints.has(nodeId)) {
+      // Pause if breakpoint hit OR in step mode
+      const shouldPause = self.breakpoints.has(nodeId) || self.stepMode;
+      if (shouldPause) {
         self.paused = true;
+        self.stepMode = false; // consumed — will be re-set by stepOver()
+        const traceEntry = self.traceHistory[self.traceHistory.length - 1];
         if (self.onBreakpoint) self.onBreakpoint(nodeId);
+        if (self.onPause) self.onPause(nodeId, self.currentStep, traceEntry);
         await self._waitForResume();
       }
     };
 
     executor.onNodeComplete = (nodeId, status, output) => {
-      const entry = self.traceHistory.find(t => t.nodeId === nodeId && t.status === 'running');
-      if (entry) {
-        entry.output = output;
-        entry.status = status;
-        entry.duration = Date.now() - entry.timestamp;
+      const traceEntry = self.traceHistory.find(t => t.nodeId === nodeId && t.status === 'running');
+      if (traceEntry) {
+        traceEntry.output = output;
+        traceEntry.status = status;
+        traceEntry.duration = Date.now() - traceEntry.timestamp;
       }
 
       if (origOnNodeComplete) origOnNodeComplete(nodeId, status, output);
@@ -590,11 +626,20 @@ class FlowDebugger {
       if (self.onTraceUpdate) self.onTraceUpdate(self.traceHistory);
     };
 
+    executor.onComplete = (ctx) => {
+      self.active = false;
+      self.paused = false;
+      if (origOnComplete) origOnComplete(ctx);
+      if (self.onFinish) self.onFinish();
+    };
+
     return executor;
   }
 
   resume() {
     this.paused = false;
+    this.stepMode = false;
+    if (this.onResume) this.onResume();
     if (this._resumeResolve) {
       this._resumeResolve();
       this._resumeResolve = null;
@@ -602,8 +647,14 @@ class FlowDebugger {
   }
 
   stepOver() {
-    // Resume but set a one-time breakpoint on the next node
-    this.resume();
+    // Resume execution but pause again at the very next node
+    this.stepMode = true;
+    this.paused = false;
+    if (this.onResume) this.onResume();
+    if (this._resumeResolve) {
+      this._resumeResolve();
+      this._resumeResolve = null;
+    }
   }
 
   _waitForResume() {

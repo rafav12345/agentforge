@@ -114,6 +114,8 @@ class FlowNode {
     node.style.top = this.y + 'px';
     node.style.setProperty('--node-color', this.config.color);
     node.dataset.nodeId = this.id;
+    node.dataset.type = this.type;
+    node.dataset.label = this.nodeConfig?.label || this.config.label;
 
     // Header
     const header = document.createElement('div');

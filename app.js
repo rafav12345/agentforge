@@ -13,6 +13,7 @@
   let canvasMgr;
   let configPanel;
   let storage;
+  let activeDebugger = null; // persists breakpoints across runs
 
   // DOM refs
   const canvasContainer = document.getElementById('canvas-container');
@@ -23,6 +24,7 @@
 
   // Autosave timer
   let autosaveTimer = null;
+  let saveModalMode = 'save';
   let validationUI;
   let executionUI;
   let dashboard;
@@ -35,6 +37,10 @@
     connectionMgr = new ConnectionManager(svgLayer);
     configPanel = new ConfigPanel(document.getElementById('config-panel'));
     storage = new StorageManager();
+    connectionMgr.onConnectionRemoved = (conn) => {
+      graph.removeEdge(conn.from.nodeId, conn.from.port, conn.to.nodeId, conn.to.port);
+      refreshGraphState();
+    };
 
     // Config panel callbacks
     configPanel.onConfigChange = (nodeId, key, value) => {
@@ -49,6 +55,7 @@
       if (node && node.el) {
         const titleEl = node.el.querySelector('.node-title');
         if (titleEl) titleEl.textContent = label || node.config.label;
+        node.el.dataset.label = label || node.config.label;
       }
     };
 
@@ -56,6 +63,7 @@
     if (flowNameEl) {
       flowNameEl.addEventListener('blur', () => {
         graph.metadata.name = flowNameEl.textContent.trim() || 'Untitled Flow';
+        flowNameEl.textContent = graph.metadata.name;
         scheduleAutosave();
       });
       flowNameEl.addEventListener('keydown', (e) => {
@@ -76,7 +84,18 @@
     setupTabs();
     setupExamples();
     setupLayout();
+    setupAIBuilder();
+    setupExport();
+    setupAPIKey();
+    setupSettings();
     updateMinimap();
+
+    // Reset param for clean demo starts
+    if (new URLSearchParams(window.location.search).has('reset')) {
+      localStorage.clear();
+      window.history.replaceState({}, '', window.location.pathname);
+      return; // Start fresh — don't load autosave
+    }
 
     // Try loading autosave
     const autosaved = storage.loadAutosave();
@@ -89,6 +108,14 @@
   // ---- Helper ----
   function getNodeById(id) {
     return graph.getNode(id);
+  }
+
+  function refreshGraphState({ autosave = true } = {}) {
+    if (validationUI) validationUI.clearHighlights();
+    if (executionUI) executionUI.clearNodeStates();
+    silentValidate();
+    updateMinimap();
+    if (autosave) scheduleAutosave();
   }
 
   // ---- Palette drag-to-canvas ----
@@ -135,10 +162,7 @@
     graph.addNode(node);
     setupNodeInteraction(node);
     hideEmptyState();
-    if (validationUI) validationUI.clearHighlights();
-    if (executionUI) executionUI.clearNodeStates();
-    updateMinimap();
-    scheduleAutosave();
+    refreshGraphState();
     showToast(`Added ${node.config.label} node`);
     return node;
   }
@@ -147,15 +171,40 @@
     const node = graph.getNode(nodeId);
     if (!node) return;
     if (configPanel.currentNodeId === nodeId) configPanel.close();
-    if (validationUI) validationUI.clearHighlights();
-    if (executionUI) executionUI.clearNodeStates();
     connectionMgr.removeConnectionsForNode(nodeId);
     node.destroy();
     graph.removeNode(nodeId);
     selectedNodes.delete(nodeId);
     if (graph.nodeCount === 0) showEmptyState();
-    updateMinimap();
-    scheduleAutosave();
+    refreshGraphState();
+  }
+
+  // ---- Breakpoint toggling ----
+  function toggleNodeBreakpoint(nodeId) {
+    // Ensure we have a debugger to store breakpoints
+    if (!activeDebugger) {
+      activeDebugger = new FlowDebugger(graph);
+    }
+    const isSet = activeDebugger.toggleBreakpoint(nodeId);
+    const node = graph.getNode(nodeId);
+    if (!node || !node.el) return;
+
+    // Add/remove visual indicator
+    const existing = node.el.querySelector('.node-breakpoint');
+    if (isSet && !existing) {
+      const dot = document.createElement('div');
+      dot.className = 'node-breakpoint';
+      dot.title = 'Breakpoint (right-click to remove)';
+      dot.addEventListener('click', (e) => {
+        e.stopPropagation();
+        toggleNodeBreakpoint(nodeId);
+      });
+      node.el.appendChild(dot);
+      showToast(`Breakpoint set on ${node.nodeConfig?.label || node.config.label}`);
+    } else if (!isSet && existing) {
+      existing.remove();
+      showToast(`Breakpoint removed`);
+    }
   }
 
   // ---- Node interaction ----
@@ -165,9 +214,17 @@
     let dragOffset = { x: 0, y: 0 };
     let hasMoved = false;
 
+    // Right-click to toggle breakpoint
+    el.addEventListener('contextmenu', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      toggleNodeBreakpoint(node.id);
+    });
+
     el.addEventListener('mousedown', (e) => {
       if (e.target.closest('.port-dot') || e.target.closest('.port')) return;
       if (e.target.closest('[data-action="delete"]')) { removeNode(node.id); return; }
+      if (e.target.closest('.node-breakpoint')) return; // don't drag when clicking breakpoint dot
 
       e.stopPropagation();
       if (!e.ctrlKey && !e.metaKey && !selectedNodes.has(node.id)) clearSelection();
@@ -255,7 +312,10 @@
           graph.addEdge(toNodeId, toPort, from.nodeId, from.port);
           added = true;
         }
-        if (added) { connectionMgr.updateAll(getNodeById); scheduleAutosave(); }
+        if (added) {
+          connectionMgr.updateAll(getNodeById);
+          refreshGraphState();
+        }
       }
       connectionMgr.endTempPath();
       connectionMgr.dragging = false;
@@ -374,8 +434,7 @@
       selectedNodes.clear();
       configPanel.close();
       showEmptyState();
-      updateMinimap();
-      scheduleAutosave();
+      refreshGraphState();
       showToast('Canvas cleared');
     });
   }
@@ -420,14 +479,13 @@
     document.getElementById('run-cancel')?.addEventListener('click', closeRunModal);
     document.getElementById('run-confirm')?.addEventListener('click', async () => {
       const input = document.getElementById('run-input-textarea').value;
+      const debugMode = document.getElementById('run-debug-mode')?.checked || false;
       closeRunModal();
 
       // Close validation panel if open
       validationUI.hide();
 
       // Run the flow — executionUI.run returns after completion
-      // We hook into the executor's onComplete inside executionUI to record
-      const origOnComplete = executionUI._recordCallback;
       executionUI._recordCallback = (ctx) => {
         if (dashboard) {
           dashboard.recordRun(ctx, graph.metadata.name, graph.nodeCount);
@@ -437,8 +495,19 @@
           analyzerUI.showDebugTrace(executionUI._lastDebugger.traceHistory, graph);
         }
       };
-      // Create debugger for trace
+
+      // Create debugger — carry over breakpoints from previous session
       const dbg = new FlowDebugger(graph);
+      if (activeDebugger) {
+        for (const bp of activeDebugger.breakpoints) {
+          dbg.breakpoints.add(bp);
+        }
+      }
+      // In debug mode, pause at the very first node
+      if (debugMode) {
+        dbg.stepMode = true;
+      }
+      activeDebugger = dbg;
       executionUI._lastDebugger = dbg;
       await executionUI.run(graph, input, connectionMgr, dbg);
       executionUI._recordCallback = null;
@@ -574,6 +643,7 @@
       `;
       item.addEventListener('click', () => {
         loadFlowData(flow);
+        silentValidate();
         menu.remove();
         showToast(`Loaded "${name}"`);
       });
@@ -710,6 +780,10 @@
     document.getElementById('btn-load')?.addEventListener('click', openLoadModal);
     document.getElementById('save-cancel')?.addEventListener('click', closeSaveModal);
     document.getElementById('save-confirm')?.addEventListener('click', () => {
+      if (saveModalMode === 'load') {
+        closeSaveModal();
+        return;
+      }
       const name = document.getElementById('save-name-input').value.trim();
       if (!name) return;
       graph.metadata.name = name;
@@ -724,6 +798,7 @@
   }
 
   function openSaveModal() {
+    saveModalMode = 'save';
     const modal = document.getElementById('save-modal');
     const nameInput = document.getElementById('save-name-input');
     const listEl = document.getElementById('saved-flows-list');
@@ -743,6 +818,7 @@
     const flows = storage.getFlowList();
     if (flows.length === 0) { showToast('No saved flows'); return; }
 
+    saveModalMode = 'load';
     const modal = document.getElementById('save-modal');
     const nameInput = document.getElementById('save-name-input');
     const listEl = document.getElementById('saved-flows-list');
@@ -834,7 +910,7 @@
     graph.metadata = data.metadata || graph.metadata;
     if (flowNameEl) flowNameEl.textContent = graph.metadata.name || 'Untitled Flow';
     if (graph.nodeCount > 0) hideEmptyState(); else showEmptyState();
-    updateMinimap();
+    refreshGraphState({ autosave: false });
   }
 
   // ---- Autosave ----
@@ -895,6 +971,368 @@
     toastEl.classList.add('show');
     clearTimeout(toastTimeout);
     toastTimeout = setTimeout(() => toastEl.classList.remove('show'), 1800);
+  }
+
+  window.showToast = showToast;
+
+  // ---- AI Builder ----
+  function setupAIBuilder() {
+    const builder = new NLFlowBuilder();
+    const modal = document.getElementById('ai-build-modal');
+    const promptEl = document.getElementById('ai-build-prompt');
+    const statusEl = document.getElementById('ai-build-status');
+    const generateBtn = document.getElementById('ai-build-generate');
+
+    document.getElementById('btn-ai-build')?.addEventListener('click', () => {
+      modal.style.display = 'flex';
+      promptEl.value = '';
+      statusEl.style.display = 'none';
+      generateBtn.disabled = false;
+      promptEl.focus();
+    });
+
+    // Suggestion chips
+    document.querySelectorAll('.ai-chip').forEach(chip => {
+      chip.addEventListener('click', () => {
+        promptEl.value = chip.dataset.prompt;
+      });
+    });
+
+    document.getElementById('ai-build-cancel')?.addEventListener('click', () => {
+      modal.style.display = 'none';
+    });
+
+    modal?.addEventListener('click', (e) => {
+      if (e.target === modal) modal.style.display = 'none';
+    });
+
+    generateBtn?.addEventListener('click', async () => {
+      const prompt = promptEl.value.trim();
+      if (!prompt) { promptEl.focus(); return; }
+
+      statusEl.style.display = 'flex';
+      generateBtn.disabled = true;
+
+      try {
+        // Small delay for visual effect
+        await new Promise(r => setTimeout(r, 600));
+        const flowData = await builder.generate(prompt);
+        modal.style.display = 'none';
+
+        // Load the flow
+        loadFlowData(flowData);
+
+        // Materialization animation: set all nodes invisible, then stagger reveal
+        const allNodes = graph.getAllNodes();
+        allNodes.forEach(n => {
+          if (n.el) n.el.classList.add('materializing');
+        });
+
+        // Force reflow
+        void document.body.offsetHeight;
+
+        // Stagger reveal
+        allNodes.forEach((n, i) => {
+          if (n.el) {
+            setTimeout(() => {
+              n.el.classList.remove('materializing');
+              n.el.classList.add('materialized');
+            }, 100 + i * 120);
+          }
+        });
+
+        // Auto-layout after brief delay
+        setTimeout(async () => {
+          if (typeof HierarchicalLayout !== 'undefined') {
+            const positions = HierarchicalLayout.apply(graph);
+            if (typeof LayoutAnimator !== 'undefined') {
+              await LayoutAnimator.animate(graph, positions, connectionMgr, getNodeById, 700);
+            } else {
+              positions.forEach(pos => {
+                const node = graph.getNode(pos.nodeId);
+                if (node) node.setPosition(pos.x, pos.y);
+              });
+              connectionMgr.updateAll(getNodeById);
+            }
+            updateMinimap();
+            scheduleAutosave();
+          }
+        }, 200 + allNodes.length * 120);
+
+        // Auto-validate
+        silentValidate();
+
+        showToast('AI generated your pipeline!');
+
+      } catch (e) {
+        console.error('AI Builder error:', e);
+        statusEl.querySelector('span').textContent = 'Generation failed — try again';
+        generateBtn.disabled = false;
+      }
+    });
+  }
+
+  // ---- Export Code ----
+  function setupExport() {
+    const modal = document.getElementById('export-modal');
+    const codeOutput = document.getElementById('export-code-output');
+
+    document.getElementById('btn-export')?.addEventListener('click', () => {
+      if (graph.nodeCount === 0) {
+        showToast('Nothing to export — add some nodes first');
+        return;
+      }
+      const gen = new CodeGenerator(graph.serialize());
+      const code = gen.generate();
+      codeOutput.innerHTML = gen.highlightPython(code);
+      codeOutput._rawCode = code;
+      modal.style.display = 'flex';
+    });
+
+    document.getElementById('export-cancel')?.addEventListener('click', () => {
+      modal.style.display = 'none';
+    });
+
+    modal?.addEventListener('click', (e) => {
+      if (e.target === modal) modal.style.display = 'none';
+    });
+
+    document.getElementById('export-copy')?.addEventListener('click', async () => {
+      const code = codeOutput._rawCode || codeOutput.textContent;
+      try {
+        await navigator.clipboard.writeText(code);
+        const btn = document.getElementById('export-copy');
+        const origHTML = btn.innerHTML;
+        btn.classList.add('btn-copied');
+        btn.innerHTML = '<svg width="14" height="14" viewBox="0 0 14 14" fill="currentColor"><path d="M2 7l3 3 7-7" stroke="currentColor" stroke-width="2" fill="none"/></svg> Copied!';
+        setTimeout(() => { btn.innerHTML = origHTML; btn.classList.remove('btn-copied'); }, 2000);
+      } catch (e) {
+        showToast('Copy failed — try selecting manually');
+      }
+    });
+
+    document.getElementById('export-download')?.addEventListener('click', () => {
+      const code = codeOutput._rawCode || codeOutput.textContent;
+      const name = (graph.metadata.name || 'pipeline').toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '') + '.py';
+      const blob = new Blob([code], { type: 'text/x-python' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url; a.download = name;
+      document.body.appendChild(a); a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      showToast(`Downloaded ${name}`);
+    });
+  }
+
+  // ---- API Key Modal ----
+  function setupAPIKey() {
+    const modal = document.getElementById('api-modal');
+    const input = document.getElementById('settings-api-key');
+    const status = document.getElementById('settings-status');
+    const apiBtn = document.getElementById('btn-api-key');
+
+    // Show connected indicator on load
+    if (localStorage.getItem('agentforge_api_key')) {
+      apiBtn?.classList.add('connected');
+    }
+
+    apiBtn?.addEventListener('click', () => {
+      const key = localStorage.getItem('agentforge_api_key') || '';
+      input.value = key;
+      status.textContent = key ? '✓ Connected' : '';
+      status.className = 'settings-status' + (key ? ' success' : '');
+      modal.style.display = 'flex';
+      setTimeout(() => input.focus(), 100);
+    });
+
+    document.getElementById('settings-save')?.addEventListener('click', () => {
+      const key = input.value.trim();
+      if (!key) {
+        status.textContent = 'Please enter an API key';
+        status.className = 'settings-status error';
+        return;
+      }
+      localStorage.setItem('agentforge_api_key', key);
+      apiBtn?.classList.add('connected');
+      status.textContent = '✓ Key saved!';
+      status.className = 'settings-status success';
+      showToast('API key saved — flows will use real Claude responses');
+      setTimeout(() => { modal.style.display = 'none'; }, 800);
+    });
+
+    document.getElementById('settings-clear-key')?.addEventListener('click', () => {
+      localStorage.removeItem('agentforge_api_key');
+      apiBtn?.classList.remove('connected');
+      input.value = '';
+      status.textContent = 'Key cleared — using simulated responses.';
+      status.className = 'settings-status error';
+      showToast('API key cleared');
+    });
+
+    document.getElementById('api-cancel')?.addEventListener('click', () => {
+      modal.style.display = 'none';
+    });
+
+    modal?.addEventListener('click', (e) => {
+      if (e.target === modal) modal.style.display = 'none';
+    });
+  }
+
+  // ---- Settings Panel ----
+  function setupSettings() {
+    const modal = document.getElementById('settings-modal');
+    const settingsBtn = document.getElementById('btn-settings');
+    const SETTINGS_KEY = 'agentforge_settings';
+
+    // Load saved settings
+    const defaults = {
+      accentColor: '#00FFB2',
+      fontSize: '13',
+      gridSnap: true,
+      autoLayout: true,
+      animSpeed: 'normal',
+      defaultModel: 'claude-sonnet-4-20250514',
+      defaultTemp: 0.7,
+      defaultTokens: '1024',
+    };
+
+    function loadSettings() {
+      try {
+        return { ...defaults, ...JSON.parse(localStorage.getItem(SETTINGS_KEY) || '{}') };
+      } catch { return { ...defaults }; }
+    }
+
+    function saveSettings(s) {
+      localStorage.setItem(SETTINGS_KEY, JSON.stringify(s));
+    }
+
+    function applySettings(s) {
+      // Accent color
+      const dim = s.accentColor + '99';
+      document.documentElement.style.setProperty('--accent', s.accentColor);
+      document.documentElement.style.setProperty('--accent-dim', s.accentColor + 'cc');
+      document.documentElement.style.setProperty('--accent-glow', s.accentColor + '26');
+
+      // Font size
+      document.documentElement.style.fontSize = s.fontSize + 'px';
+
+      // Update active swatch
+      document.querySelectorAll('#accent-swatches .swatch').forEach(sw => {
+        sw.classList.toggle('active', sw.dataset.color === s.accentColor);
+      });
+    }
+
+    // Apply on load
+    const current = loadSettings();
+    applySettings(current);
+
+    settingsBtn?.addEventListener('click', () => {
+      const s = loadSettings();
+      // Populate UI
+      document.querySelectorAll('#accent-swatches .swatch').forEach(sw => {
+        sw.classList.toggle('active', sw.dataset.color === s.accentColor);
+      });
+      document.getElementById('setting-font-size').value = s.fontSize;
+      document.getElementById('setting-grid-snap').checked = s.gridSnap;
+      document.getElementById('setting-auto-layout').checked = s.autoLayout;
+      document.getElementById('setting-anim-speed').value = s.animSpeed;
+      document.getElementById('setting-default-model').value = s.defaultModel;
+      document.getElementById('setting-default-temp').value = s.defaultTemp;
+      document.getElementById('setting-temp-display').textContent = s.defaultTemp;
+      document.getElementById('setting-default-tokens').value = s.defaultTokens;
+      modal.style.display = 'flex';
+    });
+
+    // Live accent color preview
+    document.getElementById('accent-swatches')?.addEventListener('click', (e) => {
+      const sw = e.target.closest('.swatch');
+      if (!sw) return;
+      document.querySelectorAll('#accent-swatches .swatch').forEach(s => s.classList.remove('active'));
+      sw.classList.add('active');
+      // Live preview
+      document.documentElement.style.setProperty('--accent', sw.dataset.color);
+      document.documentElement.style.setProperty('--accent-dim', sw.dataset.color + 'cc');
+      document.documentElement.style.setProperty('--accent-glow', sw.dataset.color + '26');
+    });
+
+    // Temperature slider display
+    document.getElementById('setting-default-temp')?.addEventListener('input', (e) => {
+      document.getElementById('setting-temp-display').textContent = e.target.value;
+    });
+
+    // Apply
+    document.getElementById('settings-apply')?.addEventListener('click', () => {
+      const s = {
+        accentColor: document.querySelector('#accent-swatches .swatch.active')?.dataset.color || defaults.accentColor,
+        fontSize: document.getElementById('setting-font-size').value,
+        gridSnap: document.getElementById('setting-grid-snap').checked,
+        autoLayout: document.getElementById('setting-auto-layout').checked,
+        animSpeed: document.getElementById('setting-anim-speed').value,
+        defaultModel: document.getElementById('setting-default-model').value,
+        defaultTemp: parseFloat(document.getElementById('setting-default-temp').value),
+        defaultTokens: document.getElementById('setting-default-tokens').value,
+      };
+      saveSettings(s);
+      applySettings(s);
+      modal.style.display = 'none';
+      showToast('Settings saved');
+    });
+
+    // Reset
+    document.getElementById('settings-reset')?.addEventListener('click', () => {
+      saveSettings(defaults);
+      applySettings(defaults);
+      // Re-populate UI
+      document.getElementById('setting-font-size').value = defaults.fontSize;
+      document.getElementById('setting-grid-snap').checked = defaults.gridSnap;
+      document.getElementById('setting-auto-layout').checked = defaults.autoLayout;
+      document.getElementById('setting-anim-speed').value = defaults.animSpeed;
+      document.getElementById('setting-default-model').value = defaults.defaultModel;
+      document.getElementById('setting-default-temp').value = defaults.defaultTemp;
+      document.getElementById('setting-temp-display').textContent = defaults.defaultTemp;
+      document.getElementById('setting-default-tokens').value = defaults.defaultTokens;
+      document.querySelectorAll('#accent-swatches .swatch').forEach(sw => {
+        sw.classList.toggle('active', sw.dataset.color === defaults.accentColor);
+      });
+      showToast('Settings reset to defaults');
+    });
+
+    // Cancel
+    document.getElementById('settings-cancel')?.addEventListener('click', () => {
+      // Revert live preview
+      applySettings(loadSettings());
+      modal.style.display = 'none';
+    });
+
+    modal?.addEventListener('click', (e) => {
+      if (e.target === modal) {
+        applySettings(loadSettings());
+        modal.style.display = 'none';
+      }
+    });
+
+    // Expose settings getter for other modules
+    window._agentForgeSettings = loadSettings;
+  }
+
+  // ---- Silent Validate (auto-validate without showing panel) ----
+  function silentValidate() {
+    const runBtn = document.getElementById('btn-run');
+    if (!runBtn) return;
+
+    if (graph.nodeCount === 0) {
+      runBtn.disabled = true;
+      return;
+    }
+
+    try {
+      const validator = new FlowValidator(graph);
+      const result = validator.validate();
+      runBtn.disabled = !result.executionReady;
+    } catch (e) {
+      runBtn.disabled = true;
+    }
   }
 
   // ---- Debug ----

@@ -7,6 +7,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=DM+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="styles.css">
+  <link rel="stylesheet" href="performance-optimizations.css">
 </head>
 <body>
   <!-- Top bar -->
@@ -64,6 +65,17 @@
         <svg width="14" height="14" viewBox="0 0 14 14" fill="currentColor"><path d="M7 1a6 6 0 100 12A6 6 0 007 1zm2.8 4.4l-3.2 3.2a.8.8 0 01-1.1 0L4.2 7.3a.8.8 0 011.1-1.1l.9.9 2.6-2.6a.8.8 0 011.1 1.1z"/></svg>
         Validate
       </button>
+      <button class="btn btn-ai-build" id="btn-ai-build" title="Describe a pipeline in English, AI builds it">
+        <svg width="14" height="14" viewBox="0 0 14 14" fill="currentColor"><path d="M7 1l1.5 3.5L12 6l-3.5 1.5L7 11 5.5 7.5 2 6l3.5-1.5L7 1z"/><path d="M11.5 1l.5 1.5L13.5 3l-1.5.5L11.5 5l-.5-1.5L9.5 3l1.5-.5L11.5 1z" opacity="0.6"/></svg>
+        Build with AI
+      </button>
+      <button class="btn btn-ghost" id="btn-export" title="Export flow to Python code">
+        <svg width="14" height="14" viewBox="0 0 14 14" fill="currentColor"><path d="M4 1L1 4l3 3M10 1l3 3-3 3M8 0L6 8"/></svg>
+        Export
+      </button>
+      <button class="btn btn-ghost btn-api" id="btn-api-key" title="Connect API Key">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"/></svg>
+      </button>
       <button class="btn btn-ghost" id="btn-analyze" title="Analyze & optimize flow">
         <svg width="14" height="14" viewBox="0 0 14 14" fill="currentColor"><path d="M13 13l-3.5-3.5M5.5 1a4.5 4.5 0 100 9 4.5 4.5 0 000-9zM3.5 5.5h4M5.5 3.5v4"/></svg>
         Analyze
@@ -71,6 +83,9 @@
       <button class="btn btn-primary" id="btn-run" disabled>
         <svg width="14" height="14" viewBox="0 0 14 14" fill="currentColor"><path d="M3 1l10 6-10 6V1z"/></svg>
         Run Flow
+      </button>
+      <button class="btn btn-ghost btn-settings" id="btn-settings" title="Settings">
+        <svg width="14" height="14" viewBox="0 0 14 14" fill="currentColor"><path d="M7 1.5a1 1 0 011 1v.3a4.5 4.5 0 011.6.9l.2-.1a1 1 0 011.4.3l.5.9a1 1 0 01-.4 1.3l-.2.1a4.6 4.6 0 010 1.8l.2.1a1 1 0 01.4 1.3l-.5.9a1 1 0 01-1.4.3l-.2-.1a4.5 4.5 0 01-1.6.9v.3a1 1 0 01-1 1H6a1 1 0 01-1-1v-.3a4.5 4.5 0 01-1.6-.9l-.2.1a1 1 0 01-1.4-.3l-.5-.9a1 1 0 01.4-1.3l.2-.1a4.6 4.6 0 010-1.8l-.2-.1a1 1 0 01-.4-1.3l.5-.9a1 1 0 011.4-.3l.2.1A4.5 4.5 0 015 2.8v-.3a1 1 0 011-1h1zM6.5 5a2 2 0 100 4 2 2 0 000-4z"/></svg>
       </button>
     </div>
   </header>
@@ -218,6 +233,18 @@
         <div class="execution-panel-header">
           <span class="execution-panel-title">Execution Log</span>
           <div class="execution-panel-actions">
+            <!-- Debugger toolbar (hidden until debug session active) -->
+            <div class="debugger-toolbar" id="debugger-toolbar" style="display:none">
+              <button class="btn btn-ghost btn-sm debugger-btn" id="dbg-step-over" title="Step Over (execute next node and pause)">
+                <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2 7h8M7 4l3 3-3 3"/><line x1="12" y1="2" x2="12" y2="12"/></svg>
+                Step
+              </button>
+              <button class="btn btn-ghost btn-sm debugger-btn" id="dbg-continue" title="Continue (run until next breakpoint)">
+                <svg width="14" height="14" viewBox="0 0 14 14" fill="currentColor"><path d="M3 1l10 6-10 6V1z"/></svg>
+                Continue
+              </button>
+              <span class="debugger-status" id="dbg-status"></span>
+            </div>
             <button class="btn btn-ghost btn-sm" id="execution-clear">Clear</button>
             <button class="config-close" id="execution-close">
               <svg width="14" height="14" viewBox="0 0 14 14" fill="currentColor">
@@ -227,6 +254,25 @@
           </div>
         </div>
         <div class="execution-log" id="execution-log"></div>
+      </div>
+
+      <!-- Floating data inspector (shown when paused at a node) -->
+      <div class="data-inspector" id="data-inspector" style="display:none">
+        <div class="data-inspector-header">
+          <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.3"><circle cx="7" cy="7" r="5.5"/><path d="M7 4v3l2 1.5"/></svg>
+          <span class="data-inspector-title" id="data-inspector-title">Node Data</span>
+          <button class="data-inspector-close" id="data-inspector-close">&times;</button>
+        </div>
+        <div class="data-inspector-body" id="data-inspector-body">
+          <div class="data-inspector-section">
+            <div class="data-inspector-label">Input</div>
+            <pre class="data-inspector-pre" id="data-inspector-input">—</pre>
+          </div>
+          <div class="data-inspector-section">
+            <div class="data-inspector-label">Output</div>
+            <pre class="data-inspector-pre" id="data-inspector-output">Waiting...</pre>
+          </div>
+        </div>
       </div>
 
       <!-- Analyzer panel (bottom sheet) -->
@@ -250,7 +296,7 @@
     <div class="dashboard-view" id="dashboard-view" style="display:none"></div>
 
     <!-- Arena view (hidden by default) -->
-    <div class="dashboard-view arena-view" id="arena-view" style="display:none"></div>
+    <div class="arena-view" id="arena-view" style="display:none"></div>
   </div>
 
   <!-- Save modal -->
@@ -280,6 +326,11 @@
           <svg width="12" height="12" viewBox="0 0 12 12" fill="#38BDF8"><circle cx="6" cy="6" r="5"/><path d="M6 5v3M6 3.5v.5" stroke="#0A0A0F" stroke-width="1.2"/></svg>
           <span>LLM nodes will call the Anthropic API. If unavailable, responses will be simulated.</span>
         </div>
+        <label class="run-debug-toggle" title="Pause before the first node and step through execution one node at a time">
+          <input type="checkbox" id="run-debug-mode">
+          <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.3"><circle cx="7" cy="7" r="5.5"/><circle cx="7" cy="7" r="2" fill="currentColor"/></svg>
+          <span>Debug Mode</span>
+        </label>
       </div>
       <div class="modal-actions">
         <button class="btn btn-ghost" id="run-cancel">Cancel</button>
@@ -291,6 +342,192 @@
     </div>
   </div>
 
+  <!-- AI Builder modal -->
+  <div class="modal-overlay" id="ai-build-modal" style="display:none">
+    <div class="modal ai-build-modal">
+      <div class="modal-header">
+        <svg width="18" height="18" viewBox="0 0 14 14" fill="#00FFB2"><path d="M7 1l1.5 3.5L12 6l-3.5 1.5L7 11 5.5 7.5 2 6l3.5-1.5L7 1z"/></svg>
+        Build with AI
+      </div>
+      <div class="modal-body">
+        <label class="config-label">Describe the pipeline you want to build</label>
+        <textarea class="config-textarea" id="ai-build-prompt" rows="3" placeholder="e.g., Build a customer support pipeline that classifies sentiment and routes angry messages to an escalation team..."></textarea>
+        <div class="ai-suggestion-chips" id="ai-suggestion-chips">
+          <button class="ai-chip" data-prompt="Executive decision intelligence pipeline that analyzes revenue, churn, and pipeline metrics">Decision intelligence</button>
+          <button class="ai-chip" data-prompt="Supply chain risk monitoring pipeline with demand planning and alert routing">Supply chain risk</button>
+          <button class="ai-chip" data-prompt="Customer support pipeline with sentiment routing and escalation">Customer support</button>
+          <button class="ai-chip" data-prompt="AI code review pipeline that finds security vulnerabilities and auto-fixes bugs">Code review</button>
+        </div>
+        <div class="ai-build-status" id="ai-build-status" style="display:none">
+          <div class="ai-build-spinner"></div>
+          <span>Generating pipeline...</span>
+        </div>
+      </div>
+      <div class="modal-actions">
+        <button class="btn btn-ghost" id="ai-build-cancel">Cancel</button>
+        <button class="btn btn-primary" id="ai-build-generate">
+          <svg width="14" height="14" viewBox="0 0 14 14" fill="currentColor"><path d="M7 1l1.5 3.5L12 6l-3.5 1.5L7 11 5.5 7.5 2 6l3.5-1.5L7 1z"/></svg>
+          Generate
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Export Code modal -->
+  <div class="modal-overlay" id="export-modal" style="display:none">
+    <div class="modal export-modal">
+      <div class="modal-header">
+        <svg width="18" height="18" viewBox="0 0 14 14" fill="#A78BFA"><path d="M4 1L1 4l3 3M10 1l3 3-3 3M8 0L6 8"/></svg>
+        Export to Python
+      </div>
+      <div class="modal-body export-modal-body">
+        <div class="code-block-wrapper">
+          <pre class="code-block"><code id="export-code-output"></code></pre>
+        </div>
+      </div>
+      <div class="modal-actions">
+        <button class="btn btn-ghost" id="export-download">
+          <svg width="14" height="14" viewBox="0 0 14 14" fill="currentColor"><path d="M7 1v8M4 6l3 3 3-3M2 12h10"/></svg>
+          Download .py
+        </button>
+        <button class="btn btn-ghost" id="export-cancel">Close</button>
+        <button class="btn btn-primary" id="export-copy">
+          <svg width="14" height="14" viewBox="0 0 14 14" fill="currentColor"><rect x="4" y="4" width="9" height="9" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.3"/><path d="M10 4V2.5A1.5 1.5 0 008.5 1h-6A1.5 1.5 0 001 2.5v6A1.5 1.5 0 002.5 10H4"/></svg>
+          Copy to Clipboard
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- API Key modal -->
+  <div class="modal-overlay" id="api-modal" style="display:none">
+    <div class="modal settings-modal">
+      <div class="modal-header">
+        <svg width="18" height="18" viewBox="0 0 14 14" fill="#00FFB2"><path d="M11.5 1a2.5 2.5 0 00-2.1 3.9L2 12.3l1.4 1.4 7.4-7.4A2.5 2.5 0 0011.5 1z"/></svg>
+        API Key
+      </div>
+      <div class="modal-body">
+        <p style="color:#888;font-size:13px;margin:0 0 16px">Enter your Anthropic API key to use real Claude responses. Stored locally in your browser only.</p>
+        <label style="font-size:12px;color:#666;text-transform:uppercase;letter-spacing:.5px">Anthropic API Key</label>
+        <input type="password" id="settings-api-key" class="settings-input" placeholder="sk-ant-..." spellcheck="false" autocomplete="off" />
+        <div id="settings-status" class="settings-status"></div>
+      </div>
+      <div class="modal-actions">
+        <button class="btn btn-ghost" id="settings-clear-key">Clear Key</button>
+        <button class="btn btn-ghost" id="api-cancel">Cancel</button>
+        <button class="btn btn-primary" id="settings-save">Save Key</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Settings modal -->
+  <div class="modal-overlay" id="settings-modal" style="display:none">
+    <div class="modal settings-modal settings-full">
+      <div class="modal-header">
+        <svg width="18" height="18" viewBox="0 0 14 14" fill="#00FFB2"><path d="M7 1.5a1 1 0 011 1v.3a4.5 4.5 0 011.6.9l.2-.1a1 1 0 011.4.3l.5.9a1 1 0 01-.4 1.3l-.2.1a4.6 4.6 0 010 1.8l.2.1a1 1 0 01.4 1.3l-.5.9a1 1 0 01-1.4.3l-.2-.1a4.5 4.5 0 01-1.6.9v.3a1 1 0 01-1 1H6a1 1 0 01-1-1v-.3a4.5 4.5 0 01-1.6-.9l-.2.1a1 1 0 01-1.4-.3l-.5-.9a1 1 0 01.4-1.3l.2-.1a4.6 4.6 0 010-1.8l-.2-.1a1 1 0 01-.4-1.3l.5-.9a1 1 0 011.4-.3l.2.1A4.5 4.5 0 015 2.8v-.3a1 1 0 011-1h1z"/></svg>
+        Settings
+      </div>
+      <div class="modal-body settings-body">
+        <!-- Theme -->
+        <div class="settings-section">
+          <div class="settings-section-title">Appearance</div>
+          <div class="settings-row">
+            <label class="settings-label">Accent Color</label>
+            <div class="settings-color-swatches" id="accent-swatches">
+              <button class="swatch active" data-color="#00FFB2" style="background:#00FFB2" title="Mint"></button>
+              <button class="swatch" data-color="#6366F1" style="background:#6366F1" title="Indigo"></button>
+              <button class="swatch" data-color="#F59E0B" style="background:#F59E0B" title="Amber"></button>
+              <button class="swatch" data-color="#EF4444" style="background:#EF4444" title="Red"></button>
+              <button class="swatch" data-color="#EC4899" style="background:#EC4899" title="Pink"></button>
+              <button class="swatch" data-color="#14B8A6" style="background:#14B8A6" title="Teal"></button>
+              <button class="swatch" data-color="#8B5CF6" style="background:#8B5CF6" title="Violet"></button>
+              <button class="swatch" data-color="#F97316" style="background:#F97316" title="Orange"></button>
+            </div>
+          </div>
+          <div class="settings-row">
+            <label class="settings-label">Font Size</label>
+            <select class="config-input settings-select" id="setting-font-size">
+              <option value="12">Small (12px)</option>
+              <option value="13" selected>Default (13px)</option>
+              <option value="14">Medium (14px)</option>
+              <option value="15">Large (15px)</option>
+            </select>
+          </div>
+        </div>
+
+        <!-- Canvas -->
+        <div class="settings-section">
+          <div class="settings-section-title">Canvas</div>
+          <div class="settings-row">
+            <label class="settings-label">Grid Snap</label>
+            <label class="settings-toggle">
+              <input type="checkbox" id="setting-grid-snap" checked />
+              <span class="toggle-slider"></span>
+            </label>
+          </div>
+          <div class="settings-row">
+            <label class="settings-label">Auto-Layout on Generate</label>
+            <label class="settings-toggle">
+              <input type="checkbox" id="setting-auto-layout" checked />
+              <span class="toggle-slider"></span>
+            </label>
+          </div>
+          <div class="settings-row">
+            <label class="settings-label">Animation Speed</label>
+            <select class="config-input settings-select" id="setting-anim-speed">
+              <option value="fast">Fast</option>
+              <option value="normal" selected>Normal</option>
+              <option value="slow">Slow</option>
+              <option value="off">Off</option>
+            </select>
+          </div>
+        </div>
+
+        <!-- LLM Defaults -->
+        <div class="settings-section">
+          <div class="settings-section-title">LLM Defaults</div>
+          <div class="settings-row">
+            <label class="settings-label">Default Model</label>
+            <select class="config-input settings-select" id="setting-default-model">
+              <option value="claude-sonnet-4-20250514">Claude Sonnet 4</option>
+              <option value="claude-haiku-4-5-20251001">Claude Haiku 4.5</option>
+              <option value="gpt-4o">GPT-4o</option>
+              <option value="mistral-large">Mistral Large</option>
+            </select>
+          </div>
+          <div class="settings-row">
+            <label class="settings-label">Default Temperature</label>
+            <input type="range" class="settings-range" id="setting-default-temp" min="0" max="1" step="0.1" value="0.7" />
+            <span class="settings-range-value" id="setting-temp-display">0.7</span>
+          </div>
+          <div class="settings-row">
+            <label class="settings-label">Default Max Tokens</label>
+            <select class="config-input settings-select" id="setting-default-tokens">
+              <option value="256">256</option>
+              <option value="512">512</option>
+              <option value="1024" selected>1024</option>
+              <option value="2048">2048</option>
+              <option value="4096">4096</option>
+            </select>
+          </div>
+        </div>
+      </div>
+      <div class="modal-actions">
+        <button class="btn btn-ghost" id="settings-reset">Reset to Defaults</button>
+        <button class="btn btn-ghost" id="settings-cancel">Cancel</button>
+        <button class="btn btn-primary" id="settings-apply">Apply</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Core utilities and infrastructure -->
+  <script src="utils.js"></script>
+  <script src="error-handler.js"></script>
+  <script src="event-manager.js"></script>
+  <script src="config-manager.js"></script>
+  <script src="execution-utils.js"></script>
+
+  <!-- Original modules -->
   <script src="datasets.js"></script>
   <script src="nodes.js"></script>
   <script src="connections.js"></script>
@@ -305,6 +542,8 @@
   <script src="orchestrator.js"></script>
   <script src="config-panel.js"></script>
   <script src="storage.js"></script>
+  <script src="nlbuilder.js"></script>
+  <script src="codegen.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

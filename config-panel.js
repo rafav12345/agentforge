@@ -50,20 +50,13 @@ const CONFIG_SCHEMAS = {
         title: 'Model',
         fields: [
           { key: 'label', type: 'text', label: 'Label', placeholder: 'LLM Call', default: 'LLM Call' },
-          { key: 'provider', type: 'select', label: 'Provider', default: 'anthropic',
-            options: [
-              { value: 'anthropic', label: 'Anthropic (Claude)' },
-              { value: 'openai', label: 'OpenAI (GPT)' },
-              { value: 'mistral', label: 'Mistral' },
-              { value: 'local', label: 'Local / Ollama' },
-            ]
-          },
           { key: 'model', type: 'select', label: 'Model', default: 'claude-sonnet-4-20250514',
             options: [
-              { value: 'claude-sonnet-4-20250514', label: 'Claude Sonnet 4' },
-              { value: 'claude-haiku-4-5-20251001', label: 'Claude Haiku 4.5' },
-              { value: 'gpt-4o', label: 'GPT-4o' },
+              { value: 'claude-sonnet-4-20250514', label: 'Claude Sonnet 4 (Anthropic)' },
+              { value: 'claude-haiku-4-5-20251001', label: 'Claude Haiku 4.5 (Anthropic)' },
+              { value: 'gpt-4o', label: 'GPT-4o (OpenAI)' },
               { value: 'mistral-large', label: 'Mistral Large' },
+              { value: 'local', label: 'Local / Ollama' },
             ]
           },
         ],
