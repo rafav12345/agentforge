@@ -19,7 +19,7 @@ const MultiAgentExecutors = {
   async debate(config, inputData) {
     const topic = typeof inputData === 'string' ? inputData : JSON.stringify(inputData || '');
     const rounds = config.rounds || 2;
-    const model = config.model || 'claude-sonnet-4-20250514';
+    const model = config.model || (typeof getDefaultModel === 'function' ? getDefaultModel() : 'claude-sonnet-4-20250514');
 
     // Agent A argues FOR
     const agentAPrompt = `You are Debater A. Argue FOR the following position in ${rounds > 1 ? 'a brief opening' : 'one paragraph'}:\n\n${topic}`;
@@ -47,7 +47,7 @@ const MultiAgentExecutors = {
     const input = typeof inputData === 'string' ? inputData : JSON.stringify(inputData || '');
     const count = config.agentCount || 3;
     const strategy = config.aggregation || 'best';
-    const model = config.model || 'claude-sonnet-4-20250514';
+    const model = config.model || (typeof getDefaultModel === 'function' ? getDefaultModel() : 'claude-sonnet-4-20250514');
 
     // Run N agents in parallel with slightly different temperatures
     const temps = Array.from({ length: count }, (_, i) => 0.3 + i * 0.3);
@@ -89,7 +89,7 @@ const MultiAgentExecutors = {
   async supervisor(config, inputData) {
     const task = typeof inputData === 'string' ? inputData : JSON.stringify(inputData || '');
     const workerCount = config.workerCount || 3;
-    const model = config.model || 'claude-sonnet-4-20250514';
+    const model = config.model || (typeof getDefaultModel === 'function' ? getDefaultModel() : 'claude-sonnet-4-20250514');
 
     // Supervisor plans the subtasks
     const planPrompt = `Break this task into exactly ${workerCount} independent subtasks. Output ONLY a numbered list, one subtask per line:\n\n${task}`;

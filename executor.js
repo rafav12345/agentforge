@@ -100,6 +100,9 @@ class FlowExecutor {
     this._emitLog(ctx.logs[ctx.logs.length - 1]);
 
     try {
+      if (typeof appEvents !== 'undefined') {
+        appEvents.emit(EVENT_TYPES.EXECUTION_START, { nodeCount: topoOrder.length });
+      }
       for (const nodeId of topoOrder) {
         if (ctx.aborted) {
           ctx.log(null, 'system', 'Execution aborted by user.');
@@ -129,13 +132,18 @@ class FlowExecutor {
         this._currentNodeId = nodeId;
         if (this.onNodeStart) await this.onNodeStart(nodeId);
 
+        // Non-fatal pre-flight validation: surfaces config issues as warnings.
+        this._preflightValidate(node);
+
         ctx.log(nodeId, 'start', `Executing: ${node.nodeConfig?.label || node.config.label}`, { input: inputData });
         this._emitLog(ctx.logs[ctx.logs.length - 1]);
 
+        const nodeStart = Date.now();
         try {
           const output = await this._executeNode(node, inputData, initialInput);
           ctx.setOutput(nodeId, output);
           ctx.setStatus(nodeId, EXEC_STATUS.SUCCESS);
+          this._recordNodeMetric(nodeId, node.type, Date.now() - nodeStart);
 
           ctx.log(nodeId, 'complete', `Completed: ${node.nodeConfig?.label || node.config.label}`, { output });
           this._emitLog(ctx.logs[ctx.logs.length - 1]);
@@ -161,6 +169,10 @@ class FlowExecutor {
           if (this.onNodeError) this.onNodeError(nodeId, err);
           if (this.onNodeComplete) this.onNodeComplete(nodeId, EXEC_STATUS.ERROR, null);
 
+          if (typeof appEvents !== 'undefined') {
+            appEvents.emit(EVENT_TYPES.ERROR_OCCURRED, { nodeId, message: err.message });
+          }
+
           // Stop execution on error
           break;
         }
@@ -172,6 +184,13 @@ class FlowExecutor {
       ctx.log(null, 'system', `Execution finished in ${ctx.duration}ms.`);
       this._emitLog(ctx.logs[ctx.logs.length - 1]);
 
+      if (typeof appEvents !== 'undefined') {
+        appEvents.emit(EVENT_TYPES.EXECUTION_COMPLETE, {
+          durationMs: ctx.duration,
+          report: typeof executionUtils !== 'undefined' ? executionUtils.getPerformanceReport() : null,
+        });
+      }
+
       if (this.onComplete) this.onComplete(ctx);
     }
 
@@ -180,6 +199,27 @@ class FlowExecutor {
 
   abort() {
     if (this.context) this.context.aborted = true;
+  }
+
+  // ---- Pre-flight validation (non-fatal advisory via ExecutionUtils) ----
+  _preflightValidate(node) {
+    if (typeof executionUtils === 'undefined') return;
+    try {
+      const result = executionUtils.validateNodeExecution(node, this.context);
+      const messages = [...(result.errors || []), ...(result.warnings || [])];
+      for (const message of messages) {
+        this.context.log(node.id, 'warning', message);
+        this._emitLog(this.context.logs[this.context.logs.length - 1]);
+      }
+    } catch { /* validation must never block execution */ }
+  }
+
+  // ---- Record per-node timing via ExecutionUtils ----
+  _recordNodeMetric(nodeId, type, durationMs) {
+    if (typeof executionUtils === 'undefined') return;
+    try {
+      executionUtils.recordPerformanceMetric(nodeId, type, durationMs);
+    } catch { /* metrics are best-effort */ }
   }
 
   // ---- Gather inputs from predecessors ----
@@ -297,7 +337,7 @@ class FlowExecutor {
   }
 
   async _execLLM(config, inputData) {
-    const model = config.model || 'claude-sonnet-4-20250514';
+    const model = config.model || (typeof getDefaultModel === 'function' ? getDefaultModel() : 'claude-sonnet-4-20250514');
     const systemPrompt = config.systemPrompt || '';
     const promptTemplate = config.promptTemplate || '{{input}}';
     const temperature = config.temperature ?? 0.7;

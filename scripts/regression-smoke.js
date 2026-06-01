@@ -125,6 +125,10 @@ function installBrowserStubs() {
 function loadProjectScripts() {
   const files = [
     'utils.js',
+    'error-handler.js',
+    'event-manager.js',
+    'config-manager.js',
+    'execution-utils.js',
     'datasets.js',
     'flowgraph.js',
     'validator.js',

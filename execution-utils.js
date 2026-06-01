@@ -153,12 +153,10 @@ class ExecutionUtils {
         warnings.push(...validationResult.warnings);
       }
 
-      // Sanitize configuration
-      const sanitizedConfig = Utils.sanitizeNodeConfig(node.nodeConfig);
-      if (JSON.stringify(sanitizedConfig) !== JSON.stringify(node.nodeConfig)) {
-        warnings.push('Node configuration was sanitized for security');
-        node.nodeConfig = sanitizedConfig;
-      }
+      // NOTE: validation is read-only. We do NOT mutate node.nodeConfig here —
+      // HTML-encoding live config (e.g. via sanitizeNodeConfig) corrupts prompts
+      // and templates. Security sanitization happens at the actual sinks instead
+      // (Utils.sanitizeExpression before eval, escaping before innerHTML).
 
       return {
         isValid: errors.length === 0,
@@ -188,38 +186,42 @@ class ExecutionUtils {
     const { type, nodeConfig } = node;
 
     switch (type) {
-      case 'llm':
-        if (!nodeConfig.prompt || nodeConfig.prompt.trim().length === 0) {
-          errors.push('LLM node requires a prompt');
+      case 'llm': {
+        // Real LLM config uses systemPrompt + promptTemplate (defaults to {{input}}).
+        const prompt = `${nodeConfig.systemPrompt || ''}${nodeConfig.promptTemplate || ''}`;
+        if (prompt.trim().length === 0) {
+          warnings.push('LLM node has no system prompt or prompt template');
         }
-        if (nodeConfig.prompt && nodeConfig.prompt.length > 10000) {
+        if (prompt.length > 10000) {
           warnings.push('Very long prompt may affect performance');
         }
         break;
+      }
 
       case 'condition':
-        if (!nodeConfig.condition) {
-          errors.push('Condition node requires an expression');
+        // Real condition config uses `expression` (defaults to false when empty).
+        if (!nodeConfig.expression) {
+          warnings.push('Condition node has no expression (will evaluate false)');
         } else {
           try {
-            Utils.sanitizeExpression(nodeConfig.condition);
+            Utils.sanitizeExpression(nodeConfig.expression);
           } catch (error) {
             errors.push(`Invalid condition expression: ${error.message}`);
           }
         }
         break;
 
-      case 'loop':
-        const iterations = parseInt(nodeConfig.iterations);
-        if (isNaN(iterations) || iterations < 1) {
-          errors.push('Loop node requires valid iteration count');
-        } else if (iterations > 1000) {
+      case 'loop': {
+        // Real loop config uses `maxIterations`.
+        const iterations = parseInt(nodeConfig.maxIterations, 10);
+        if (!isNaN(iterations) && iterations > 1000) {
           warnings.push('High iteration count may affect performance');
         }
         break;
+      }
 
       case 'input':
-        if (!nodeConfig.inputData && !context.userInput) {
+        if (!nodeConfig.defaultValue && !context.userInput) {
           warnings.push('Input node has no data source');
         }
         break;
@@ -229,7 +231,9 @@ class ExecutionUtils {
         break;
 
       default:
-        warnings.push(`Unknown node type: ${type}`);
+        // Other node types (tool, datasource, merge, multi-agent) have no
+        // pre-flight requirements here.
+        break;
     }
 
     return { errors, warnings };

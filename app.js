@@ -1335,30 +1335,45 @@
     }
   }
 
-  // ---- Debug ----
-  window.__agentforge = {
-    get graph() { return graph; },
-    get connections() { return connectionMgr; },
-    get validation() { return validationUI; },
-    get execution() { return executionUI; },
-    get dashboard() { return dashboard; },
-    get analyzer() { return analyzerUI; },
-    get arena() { return arenaUI?.arena; },
-    debugGraph() { graph.debugPrint(); },
-    validate() { return new FlowValidator(graph).validate(); },
-    pathfind(startId, endId) {
-      const pf = new FlowPathfinder(graph);
-      console.log('Dijkstra:', pf.dijkstra(startId, endId));
-      console.log('A*:', pf.astar(startId, endId));
-      console.log('All paths:', pf.allPaths(startId, endId));
-    },
-    optimize() {
-      const opt = new FlowOptimizer(graph);
-      const report = opt.analyze();
-      console.log('Optimization report:', report);
-      return report;
-    },
-  };
+  // ---- Debug surface ----
+  // Only exposed on localhost or when developer.debugMode is enabled, so the
+  // live internal state isn't reachable from the console in production.
+  const isLocalhost = ['localhost', '127.0.0.1', ''].includes(location.hostname);
+  const debugEnabled = isLocalhost ||
+    (typeof configManager !== 'undefined' && configManager.get('developer.debugMode', false));
+
+  if (debugEnabled) {
+    window.__agentforge = {
+      get graph() { return graph; },
+      get connections() { return connectionMgr; },
+      get validation() { return validationUI; },
+      get execution() { return executionUI; },
+      get dashboard() { return dashboard; },
+      get analyzer() { return analyzerUI; },
+      get arena() { return arenaUI?.arena; },
+      debugGraph() { graph.debugPrint(); },
+      validate() { return new FlowValidator(graph).validate(); },
+      pathfind(startId, endId) {
+        const pf = new FlowPathfinder(graph);
+        console.log('Dijkstra:', pf.dijkstra(startId, endId));
+        console.log('A*:', pf.astar(startId, endId));
+        console.log('All paths:', pf.allPaths(startId, endId));
+      },
+      optimize() {
+        const opt = new FlowOptimizer(graph);
+        const report = opt.analyze();
+        console.log('Optimization report:', report);
+        return report;
+      },
+    };
+
+    // Surface per-run performance metrics when debugging.
+    if (typeof appEvents !== 'undefined') {
+      appEvents.on(EVENT_TYPES.EXECUTION_COMPLETE, ({ durationMs, report }) => {
+        console.log(`[AgentForge] Execution complete in ${durationMs}ms`, report || '');
+      });
+    }
+  }
 
   // ---- Start ----
   init();

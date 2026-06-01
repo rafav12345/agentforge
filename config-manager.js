@@ -21,10 +21,12 @@ class ConfigManager {
   getDefaultConfig() {
     return {
       // API Settings
+      // Note: the API key is intentionally NOT stored here. It lives in
+      // sessionStorage via Utils.getApiKey()/setApiKey() so there is a single
+      // source of truth and a smaller exposure window.
       api: {
-        anthropicKey: '',
         endpoint: 'https://api.anthropic.com/v1/messages',
-        defaultModel: 'claude-3-sonnet-20240229',
+        defaultModel: 'claude-sonnet-4-20250514',
         timeout: 30000,
         retryAttempts: 3,
         enableCache: true,
@@ -386,3 +388,10 @@ class ConfigManager {
 
 // Global configuration manager instance
 const configManager = new ConfigManager();
+
+// Shared accessor for the default model so executor/orchestrator stay in sync
+// with the configured value (falls back to the latest Sonnet if config is absent).
+function getDefaultModel() {
+  return (typeof configManager !== 'undefined' && configManager.get('api.defaultModel')) ||
+    'claude-sonnet-4-20250514';
+}
