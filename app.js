@@ -1133,12 +1133,12 @@
     const apiBtn = document.getElementById('btn-api-key');
 
     // Show connected indicator on load
-    if (localStorage.getItem('agentforge_api_key')) {
+    if (Utils.getApiKey()) {
       apiBtn?.classList.add('connected');
     }
 
     apiBtn?.addEventListener('click', () => {
-      const key = localStorage.getItem('agentforge_api_key') || '';
+      const key = Utils.getApiKey();
       input.value = key;
       status.textContent = key ? '✓ Connected' : '';
       status.className = 'settings-status' + (key ? ' success' : '');
@@ -1153,7 +1153,7 @@
         status.className = 'settings-status error';
         return;
       }
-      localStorage.setItem('agentforge_api_key', key);
+      Utils.setApiKey(key);
       apiBtn?.classList.add('connected');
       status.textContent = '✓ Key saved!';
       status.className = 'settings-status success';
@@ -1162,7 +1162,7 @@
     });
 
     document.getElementById('settings-clear-key')?.addEventListener('click', () => {
-      localStorage.removeItem('agentforge_api_key');
+      Utils.clearApiKey();
       apiBtn?.classList.remove('connected');
       input.value = '';
       status.textContent = 'Key cleared — using simulated responses.';

@@ -57,6 +57,36 @@ class Utils {
   }
 
   /**
+   * API key storage. Uses sessionStorage so the key does NOT persist across
+   * browser sessions (smaller exposure window than localStorage). Performs a
+   * one-time migration of any key previously saved in localStorage.
+   */
+  static get API_KEY_NAME() {
+    return 'agentforge_api_key';
+  }
+
+  static getApiKey() {
+    // Migrate a legacy localStorage key into sessionStorage, then drop it.
+    const legacy = localStorage.getItem(this.API_KEY_NAME);
+    if (legacy) {
+      sessionStorage.setItem(this.API_KEY_NAME, legacy);
+      localStorage.removeItem(this.API_KEY_NAME);
+    }
+    return sessionStorage.getItem(this.API_KEY_NAME) || '';
+  }
+
+  static setApiKey(key) {
+    sessionStorage.setItem(this.API_KEY_NAME, key);
+    // Ensure no stale persistent copy lingers.
+    localStorage.removeItem(this.API_KEY_NAME);
+  }
+
+  static clearApiKey() {
+    sessionStorage.removeItem(this.API_KEY_NAME);
+    localStorage.removeItem(this.API_KEY_NAME);
+  }
+
+  /**
    * Validate and sanitize node configuration
    * @param {Object} config - Node configuration object
    * @returns {Object} - Sanitized configuration

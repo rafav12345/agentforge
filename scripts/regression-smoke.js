@@ -63,8 +63,25 @@ function createElementStub() {
   };
 }
 
+function createStorageStub() {
+  const store = new Map();
+  return {
+    getItem(key) {
+      return store.has(key) ? store.get(key) : null;
+    },
+    setItem(key, value) {
+      store.set(key, String(value));
+    },
+    removeItem(key) {
+      store.delete(key);
+    },
+    clear() {
+      store.clear();
+    },
+  };
+}
+
 function installBrowserStubs() {
-  const storage = new Map();
   const body = createElementStub();
   body.offsetHeight = 0;
   const setGlobal = (name, value) => {
@@ -94,20 +111,8 @@ function installBrowserStubs() {
     querySelector() { return null; },
     querySelectorAll() { return []; },
   });
-  setGlobal('localStorage', {
-    getItem(key) {
-      return storage.has(key) ? storage.get(key) : null;
-    },
-    setItem(key, value) {
-      storage.set(key, String(value));
-    },
-    removeItem(key) {
-      storage.delete(key);
-    },
-    clear() {
-      storage.clear();
-    },
-  });
+  setGlobal('localStorage', createStorageStub());
+  setGlobal('sessionStorage', createStorageStub());
   setGlobal('navigator', { userAgent: 'node-regression-smoke' });
   setGlobal('location', { hostname: 'localhost', href: 'http://localhost/' });
   setGlobal('performance', { now: () => Date.now() });
@@ -119,6 +124,7 @@ function installBrowserStubs() {
 
 function loadProjectScripts() {
   const files = [
+    'utils.js',
     'datasets.js',
     'flowgraph.js',
     'validator.js',
@@ -199,6 +205,36 @@ async function runReconvergingBranchRegression() {
   assert(output === 'A=negative | B=', `Reconverging branch regression: expected "A=negative | B=", received ${JSON.stringify(output)}`);
 }
 
+async function runMaliciousExpressionRegression() {
+  // A condition expression that tries to touch localStorage must be rejected by
+  // Utils.sanitizeExpression, caught, and defaulted to false (the false branch
+  // is taken) — never executed.
+  const flow = {
+    version: 1,
+    metadata: { name: 'Malicious Expression Flow', created: Date.now(), modified: Date.now() },
+    nodes: [
+      { id: 'in', type: 'input', x: 0, y: 0, config: { label: 'Input', defaultValue: 'secret' } },
+      { id: 'cond', type: 'condition', x: 0, y: 0, config: { label: 'Route', expression: "localStorage.getItem('agentforge_api_key') || true", evaluator: 'javascript' } },
+      { id: 'merge', type: 'merge', x: 0, y: 0, config: { label: 'Merge', strategy: 'template', template: 'A={{input_a}} | B={{input_b}}' } },
+      { id: 'out', type: 'output', x: 0, y: 0, config: { label: 'Output' } },
+    ],
+    edges: [
+      { from: 'in', fromPort: 'output', to: 'cond', toPort: 'input' },
+      { from: 'cond', fromPort: 'true', to: 'merge', toPort: 'input_a' },
+      { from: 'cond', fromPort: 'false', to: 'merge', toPort: 'input_b' },
+      { from: 'merge', fromPort: 'merged', to: 'out', toPort: 'input' },
+    ],
+  };
+
+  const graph = buildGraph(flow);
+  const ctx = await new FlowExecutor(graph).execute('secret');
+  const output = ctx.getOutput('out');
+
+  // If the expression had executed it would be truthy → input_a. Sanitization
+  // forces false → input_b, so input_a must be empty.
+  assert(output === 'A= | B=secret', `Malicious expression regression: expected false branch ("A= | B=secret"), received ${JSON.stringify(output)}`);
+}
+
 function runSingleInputReplacementRegression() {
   const graph = new FlowGraph();
   const inputA = createRuntimeNode('input', 0, 0, 'input_a');
@@ -229,6 +265,7 @@ function registerTests() {
   }
 
   test('regression: reconverging condition branch', runReconvergingBranchRegression);
+  test('regression: malicious condition expression is rejected', runMaliciousExpressionRegression);
   test('regression: single-input port replacement', runSingleInputReplacementRegression);
 }
 

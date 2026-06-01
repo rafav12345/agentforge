@@ -133,7 +133,7 @@ const MultiAgentExecutors = {
 
   // ---- Shared LLM helper (with streaming support) ----
   async _callLLM(prompt, systemPrompt, model, temperature = 0.7) {
-    const apiKey = localStorage.getItem('agentforge_api_key');
+    const apiKey = Utils.getApiKey();
     try {
       if (!apiKey) throw new Error('No API key');
       const response = await fetch('https://api.anthropic.com/v1/messages', {

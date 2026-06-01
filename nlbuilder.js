@@ -11,7 +11,7 @@ class NLFlowBuilder {
   /* ---- Main entry point ---- */
   async generate(prompt) {
     // Try real API if key is available
-    const apiKey = localStorage.getItem('agentforge_api_key');
+    const apiKey = Utils.getApiKey();
     if (apiKey) {
       try {
         const flow = await this._callAPI(apiKey, prompt);

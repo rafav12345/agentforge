@@ -323,7 +323,7 @@ class FlowExecutor {
       };
       if (systemPrompt) body.system = systemPrompt;
 
-      const apiKey = localStorage.getItem('agentforge_api_key');
+      const apiKey = Utils.getApiKey();
       if (!apiKey) throw new Error('Failed to fetch'); // no key → fallback to simulation
 
       const response = await fetch('https://api.anthropic.com/v1/messages', {
@@ -560,20 +560,23 @@ class FlowExecutor {
 
     try {
       switch (evaluator) {
-        case 'javascript':
-          // Safely evaluate with input available
-          const fn = new Function('input', `return Boolean(${normalizedExpression || 'false'})`);
+        case 'javascript': {
+          // Reject dangerous patterns before evaluating user-supplied input.
+          const safeExpression = Utils.sanitizeExpression(normalizedExpression || 'false');
+          const fn = new Function('input', `return Boolean(${safeExpression})`);
           result = fn(inputStr);
           break;
+        }
 
         case 'contains':
           result = inputStr.includes(expression);
           break;
 
-        case 'regex':
+        case 'regex': {
           const regex = new RegExp(expression);
           result = regex.test(inputStr);
           break;
+        }
 
         case 'llm':
           // For LLM judge, just pass true for now (Phase 4+)

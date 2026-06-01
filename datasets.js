@@ -87,14 +87,18 @@ function formatDatasetForLLM(datasetName, dataset, filterExpr) {
   // Apply optional filter
   if (filterExpr && filterExpr.trim()) {
     try {
+      // Reject dangerous patterns, then bind each column as a named parameter
+      // (no `with`) so the expression can reference columns by name safely.
+      const safeExpr = Utils.sanitizeExpression(filterExpr);
       const cols = dataset.columns;
+      const validCols = cols.filter(col => /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(col));
+      const predicate = new Function(...validCols, `return (${safeExpr});`);
       rows = rows.filter(row => {
-        const obj = {};
-        cols.forEach((col, i) => obj[col] = row[i]);
-        return new Function('row', `with(row) { return ${filterExpr}; }`)(obj);
+        const args = validCols.map(col => row[cols.indexOf(col)]);
+        return predicate(...args);
       });
     } catch (e) {
-      // If filter fails, use all rows
+      // If filter fails (bad expression, prohibited pattern), use all rows.
     }
   }
 
