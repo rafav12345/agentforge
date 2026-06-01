@@ -521,6 +521,9 @@ class FlowExecutor {
 
     if (toolType === 'http' && url) {
       try {
+        // Block SSRF to loopback/private/link-local targets before fetching.
+        Utils.assertSafeUrl(url);
+
         const inputStr = typeof inputData === 'string' ? inputData : JSON.stringify(inputData || '');
         const finalBody = bodyTemplate.replace(/\{\{input\}\}/g, inputStr);
 

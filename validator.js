@@ -570,11 +570,12 @@ class ValidationUI {
 
         const item = document.createElement('div');
         item.className = 'validation-topo-item';
+        // Escape the user-editable label to prevent HTML/script injection.
         item.innerHTML = `
           <span class="validation-topo-index">${index + 1}</span>
-          <span class="validation-topo-dot" style="background: ${color}"></span>
-          <span class="validation-topo-label">${label}</span>
-          <span class="validation-topo-type">${node.type}</span>
+          <span class="validation-topo-dot" style="background: ${Utils.sanitizeHTML(color)}"></span>
+          <span class="validation-topo-label">${Utils.sanitizeHTML(label)}</span>
+          <span class="validation-topo-type">${Utils.sanitizeHTML(node.type)}</span>
         `;
 
         // Click to select node

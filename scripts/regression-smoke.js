@@ -235,6 +235,33 @@ async function runMaliciousExpressionRegression() {
   assert(output === 'A= | B=secret', `Malicious expression regression: expected false branch ("A= | B=secret"), received ${JSON.stringify(output)}`);
 }
 
+function runSsrfGuardRegression() {
+  const blocked = [
+    'http://169.254.169.254/latest/meta-data/', // cloud metadata
+    'http://localhost:11434/api',
+    'http://127.0.0.1:8080',
+    'http://10.0.0.5',
+    'http://192.168.1.10',
+    'http://172.16.0.1',
+    'http://printer.local',
+    'file:///etc/passwd',
+    'ftp://example.com',
+    'not a url',
+  ];
+  for (const u of blocked) {
+    let threw = false;
+    try { Utils.assertSafeUrl(u); } catch { threw = true; }
+    assert(threw, `SSRF guard regression: expected ${JSON.stringify(u)} to be blocked`);
+  }
+
+  const allowed = ['https://api.example.com/v1/x', 'http://example.com:3000/path'];
+  for (const u of allowed) {
+    let threw = false;
+    try { Utils.assertSafeUrl(u); } catch { threw = true; }
+    assert(!threw, `SSRF guard regression: expected ${JSON.stringify(u)} to be allowed`);
+  }
+}
+
 function runSingleInputReplacementRegression() {
   const graph = new FlowGraph();
   const inputA = createRuntimeNode('input', 0, 0, 'input_a');
@@ -266,6 +293,7 @@ function registerTests() {
 
   test('regression: reconverging condition branch', runReconvergingBranchRegression);
   test('regression: malicious condition expression is rejected', runMaliciousExpressionRegression);
+  test('regression: SSRF guard blocks internal targets', runSsrfGuardRegression);
   test('regression: single-input port replacement', runSingleInputReplacementRegression);
 }
 

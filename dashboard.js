@@ -372,7 +372,7 @@ class Dashboard {
       }
 
       bar.innerHTML = `
-        <div class="timeline-bar-label">${label}</div>
+        <div class="timeline-bar-label">${this._esc(label)}</div>
         <div class="timeline-bar-track">
           <div class="timeline-bar-fill" style="width: ${pct}%; left: ${(cumulative / run.duration) * 100}%"></div>
         </div>

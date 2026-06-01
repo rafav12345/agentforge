@@ -87,6 +87,51 @@ class Utils {
   }
 
   /**
+   * Validate a user-supplied URL before fetching from it (Tool node), to limit
+   * SSRF. Allows only http/https and blocks loopback, private, and link-local
+   * targets (incl. the 169.254.169.254 cloud metadata endpoint).
+   * Note: this cannot defend against DNS rebinding (a public hostname that
+   * resolves to a private IP); it blocks the direct-address cases.
+   * @param {string} urlString
+   * @returns {string} - The normalized URL, or throws if blocked.
+   */
+  static assertSafeUrl(urlString) {
+    let url;
+    try {
+      url = new URL(urlString);
+    } catch {
+      throw new Error('Invalid URL');
+    }
+
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+      throw new Error(`Blocked URL scheme: ${url.protocol}`);
+    }
+
+    const host = url.hostname.toLowerCase().replace(/^\[|\]$/g, '');
+    if (host === 'localhost' || host === '0.0.0.0' || host === '::1' || host.endsWith('.local')) {
+      throw new Error(`Blocked host: ${host}`);
+    }
+
+    const ipv4 = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+    if (ipv4) {
+      const a = Number(ipv4[1]);
+      const b = Number(ipv4[2]);
+      const isPrivate =
+        a === 0 ||                            // 0.0.0.0/8
+        a === 127 ||                          // loopback
+        a === 10 ||                           // private /8
+        (a === 192 && b === 168) ||           // private /16
+        (a === 172 && b >= 16 && b <= 31) ||  // private /12
+        (a === 169 && b === 254);             // link-local / cloud metadata
+      if (isPrivate) {
+        throw new Error(`Blocked private address: ${host}`);
+      }
+    }
+
+    return url.href;
+  }
+
+  /**
    * Validate and sanitize node configuration
    * @param {Object} config - Node configuration object
    * @returns {Object} - Sanitized configuration
