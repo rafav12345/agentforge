@@ -392,7 +392,11 @@ class ExecutionUtils {
     const report = {};
 
     for (const [key, metrics] of this.performanceMetrics.entries()) {
-      const [nodeId, operation] = key.split('_');
+      // Key format is `${nodeId}_${operation}`. Node IDs may contain
+      // underscores, so split on the LAST one (operation never does).
+      const sep = key.lastIndexOf('_');
+      const nodeId = sep === -1 ? key : key.slice(0, sep);
+      const operation = sep === -1 ? '' : key.slice(sep + 1);
 
       if (!report[nodeId]) {
         report[nodeId] = {};

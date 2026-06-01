@@ -579,12 +579,17 @@ class FlowExecutor {
         }
 
         const response = await fetch(url, fetchOptions);
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status} ${response.statusText}`.trim());
+        }
         const text = await response.text();
 
         try { return JSON.parse(text); } catch { return text; }
 
       } catch (err) {
-        return `[Tool Error] ${err.message}`;
+        // Fail the node so the pipeline halts with an error status, rather than
+        // passing an error string downstream as if it were valid tool output.
+        throw new Error(`Tool request failed: ${err.message}`);
       }
     }
 

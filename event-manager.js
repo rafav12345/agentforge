@@ -6,7 +6,7 @@
 class EventManager {
   constructor() {
     this.listeners = new Map(); // eventType -> Set of callbacks
-    this.throttledEvents = new Map(); // eventType -> throttled callback
+    this.wrappedEvents = new Map(); // key -> throttled/debounced callback
   }
 
   /**
@@ -22,11 +22,13 @@ class EventManager {
 
     let finalCallback = callback;
 
-    // Handle throttling
-    if (options.throttle) {
-      const throttleKey = `${eventType}_${callback.name || Math.random()}`;
-      finalCallback = this.throttle(callback, options.throttle);
-      this.throttledEvents.set(throttleKey, finalCallback);
+    // Optional rate limiting: throttle (leading) or debounce (trailing).
+    if (options.throttle || options.debounce) {
+      const wrapKey = `${eventType}_${callback.name || Math.random()}`;
+      finalCallback = options.throttle
+        ? this.throttle(callback, options.throttle)
+        : this.debounce(callback, options.debounce);
+      this.wrappedEvents.set(wrapKey, finalCallback);
     }
 
     // Handle once listeners
@@ -67,25 +69,45 @@ class EventManager {
   }
 
   /**
-   * Throttle a function to limit execution frequency
+   * Throttle: invoke at most once per `delay` ms on the leading edge, with a
+   * single trailing invocation for the last call that arrived during cooldown.
    */
   throttle(func, delay) {
-    let timeoutId;
+    let timeoutId = null;
     let lastExecTime = 0;
 
     return function (...args) {
-      const currentTime = Date.now();
+      const now = Date.now();
+      const remaining = delay - (now - lastExecTime);
 
-      if (currentTime - lastExecTime > delay) {
+      if (remaining <= 0) {
+        if (timeoutId) { clearTimeout(timeoutId); timeoutId = null; }
+        lastExecTime = now;
         func.apply(this, args);
-        lastExecTime = currentTime;
-      } else {
-        clearTimeout(timeoutId);
+      } else if (!timeoutId) {
+        // Schedule one trailing call at the end of the window (not rescheduled
+        // on every event, so it always fires).
         timeoutId = setTimeout(() => {
-          func.apply(this, args);
           lastExecTime = Date.now();
-        }, delay - (currentTime - lastExecTime));
+          timeoutId = null;
+          func.apply(this, args);
+        }, remaining);
       }
+    };
+  }
+
+  /**
+   * Debounce: invoke only after `delay` ms have elapsed since the last call.
+   */
+  debounce(func, delay) {
+    let timeoutId = null;
+
+    return function (...args) {
+      if (timeoutId) clearTimeout(timeoutId);
+      timeoutId = setTimeout(() => {
+        timeoutId = null;
+        func.apply(this, args);
+      }, delay);
     };
   }
 
@@ -94,7 +116,7 @@ class EventManager {
    */
   removeAllListeners() {
     this.listeners.clear();
-    this.throttledEvents.clear();
+    this.wrappedEvents.clear();
   }
 }
 

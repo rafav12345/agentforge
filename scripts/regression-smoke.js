@@ -239,6 +239,24 @@ async function runMaliciousExpressionRegression() {
   assert(output === 'A= | B=secret', `Malicious expression regression: expected false branch ("A= | B=secret"), received ${JSON.stringify(output)}`);
 }
 
+function runPerfReportRegression() {
+  // Node IDs may contain underscores; the report must not split them apart.
+  executionUtils.recordPerformanceMetric('node_abc_123', 'llm', 10);
+  const report = executionUtils.getPerformanceReport();
+  assert(
+    report['node_abc_123'] && report['node_abc_123'].llm,
+    `Perf report regression: expected grouping under 'node_abc_123' -> 'llm', got ${JSON.stringify(Object.keys(report))}`
+  );
+}
+
+async function runDebounceRegression() {
+  let calls = 0;
+  const fn = appEvents.debounce(() => { calls += 1; }, 20);
+  fn(); fn(); fn(); // three rapid calls collapse into one
+  await new Promise(resolve => setTimeout(resolve, 40));
+  assert(calls === 1, `Debounce regression: expected 1 call, got ${calls}`);
+}
+
 function runSsrfGuardRegression() {
   const blocked = [
     'http://169.254.169.254/latest/meta-data/', // cloud metadata
@@ -298,6 +316,8 @@ function registerTests() {
   test('regression: reconverging condition branch', runReconvergingBranchRegression);
   test('regression: malicious condition expression is rejected', runMaliciousExpressionRegression);
   test('regression: SSRF guard blocks internal targets', runSsrfGuardRegression);
+  test('regression: perf report keeps underscored node IDs intact', runPerfReportRegression);
+  test('regression: event debounce collapses rapid calls', runDebounceRegression);
   test('regression: single-input port replacement', runSingleInputReplacementRegression);
 }
 
